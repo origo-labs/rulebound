@@ -15,6 +15,7 @@ path = "src/main.rs"
 workspace = true
 
 [dependencies]
+blake3 = { workspace = true }
 rulebound-git = { workspace = true }
 rulebound-observe = { workspace = true }
 rulebound-orchestrate = { workspace = true }

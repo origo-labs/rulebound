@@ -175,22 +175,29 @@ fn run(cli: Cli) -> Result<Verdict, String> {
     let budget = resolve_budget(cli_budget, Some(&contract))?;
 
     let obs = capture(&repo, &base, budget, true)?;
+    let contract_bytes = std::fs::read(
+        repo.root()
+            .join(rulebound_contract::parse::CONTRACT_FILENAME),
+    )
+    .map_err(|error| format!("could not read contract bytes: {error}"))?;
     let (cargo_version, tool_version) = tool_versions();
-    let evaluation = evaluate(
+    let evaluation_now = unix_now();
+    let mut evaluation = evaluate(
         &contract,
         &obs,
         &EvaluationOptions {
             execution_root: repo.root().as_std_path().to_path_buf(),
             environment: rulebound_exec::EnvironmentPolicy::inherit_all(),
-            baseline: base,
+            baseline: base.clone(),
             candidate: "HEAD".to_string(),
-            now_unix: unix_now(),
-            cargo_version,
-            external_tool_version: tool_version,
+            now_unix: evaluation_now,
+            cargo_version: cargo_version.clone(),
+            external_tool_version: tool_version.clone(),
             cancellation: rulebound_service::CancellationToken::default(),
             resource_limits: rulebound_service::ResourceLimits::default(),
         },
     );
+    evaluation.contract_fingerprint = Some(blake3::hash(&contract_bytes).to_hex().to_string());
 
     let report = Report {
         contract: &contract,
@@ -198,14 +205,32 @@ fn run(cli: Cli) -> Result<Verdict, String> {
         verdict: evaluation.verdict,
         tool_version: env!("CARGO_PKG_VERSION"),
     };
+    let report_context = rulebound_report::ReportContext {
+        baseline_commit: base,
+        candidate_identity: evaluation
+            .candidate_identity
+            .as_ref()
+            .map(ToString::to_string),
+        observation_fingerprint: evaluation.observation_fingerprint.clone(),
+        contract_fingerprint: evaluation.contract_fingerprint.clone(),
+        evaluated_at_unix: evaluation_now,
+        cargo_version,
+        external_tool_version: tool_version,
+        allowed_environment_names: evaluation.allowed_environment_names.clone(),
+        trust_failures: evaluation
+            .trust_failures
+            .iter()
+            .map(|failure| format!("{failure:?}"))
+            .collect(),
+    };
     // The report goes to stdout so it can be piped; anything a human needs
     // that is *not* the report goes to stderr.
     print!(
         "{}",
         match format {
-            Format::Human => report.human(),
-            Format::Json => report.json(),
-            Format::Sarif => report.sarif(),
+            Format::Human => report.human_with_context(&report_context),
+            Format::Json => report.json_with_context(&report_context),
+            Format::Sarif => report.sarif_with_context(&report_context),
         }
     );
     Ok(evaluation.verdict)

@@ -29,6 +29,31 @@ pub const TOOL_NAME: &str = "rulebound";
 pub const SARIF_VERSION: &str = "2.1.0";
 /// The partialFingerprint key carrying [`Finding::fingerprint`].
 pub const FINGERPRINT_KEY: &str = "ruleboundFingerprint/v1";
+/// Version of the stable serialized report envelope.
+pub const REPORT_SCHEMA_VERSION: &str = "1.0";
+
+/// Evaluation metadata added to a rendered report envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportContext {
+    /// Resolved baseline commit identifier.
+    pub baseline_commit: String,
+    /// Full candidate snapshot identity.
+    pub candidate_identity: Option<String>,
+    /// Fingerprint of the complete observation.
+    pub observation_fingerprint: Option<String>,
+    /// Fingerprint of the original contract bytes.
+    pub contract_fingerprint: Option<String>,
+    /// Caller supplied Unix timestamp for the evaluation.
+    pub evaluated_at_unix: i64,
+    /// Cargo version used for delegated checks.
+    pub cargo_version: String,
+    /// External tool version used for delegated checks.
+    pub external_tool_version: String,
+    /// Environment variable names permitted for child processes.
+    pub allowed_environment_names: Vec<String>,
+    /// Snapshot trust failures discovered during evaluation.
+    pub trust_failures: Vec<String>,
+}
 
 /// The three targets, as top-level JSON keys.
 ///
@@ -133,6 +158,29 @@ impl Report<'_> {
         out
     }
 
+    /// The human report with its evaluation identity and runtime metadata.
+    pub fn human_with_context(&self, context: &ReportContext) -> String {
+        let mut output = self.human();
+        output.push_str(&format!(
+            "schema_version: {REPORT_SCHEMA_VERSION}\nbaseline_commit: {}\n",
+            context.baseline_commit
+        ));
+        output.push_str(&format!(
+            "candidate_identity: {}\nobservation_fingerprint: {}\ncontract_fingerprint: {}\nevaluated_at_unix: {}\n",
+            context.candidate_identity.as_deref().unwrap_or("<unavailable>"),
+            context.observation_fingerprint.as_deref().unwrap_or("<unavailable>"),
+            context.contract_fingerprint.as_deref().unwrap_or("<unavailable>"),
+            context.evaluated_at_unix,
+        ));
+        if !context.trust_failures.is_empty() {
+            output.push_str("trust_failures:\n");
+            for failure in &context.trust_failures {
+                output.push_str(&format!("  - {failure}\n"));
+            }
+        }
+        output
+    }
+
     /// The JSON report. The three targets are separate top-level keys.
     pub fn json(&self) -> String {
         let value = self.json_value();
@@ -196,6 +244,20 @@ impl Report<'_> {
                 "reviewed": self.contract.judgement.reviewed,
             },
         })
+    }
+
+    /// The JSON report with its versioned evaluation envelope.
+    pub fn json_with_context(&self, context: &ReportContext) -> String {
+        serde_json::to_string_pretty(&self.json_value_with_context(context))
+            .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// The JSON report value with evaluation identity and runtime metadata.
+    pub fn json_value_with_context(&self, context: &ReportContext) -> serde_json::Value {
+        let mut value = self.json_value();
+        value["schemaVersion"] = serde_json::Value::String(REPORT_SCHEMA_VERSION.to_string());
+        value["evaluation"] = context_json(context, self.runs);
+        value
     }
 
     /// The SARIF 2.1.0 report.
@@ -280,6 +342,59 @@ impl Report<'_> {
             }],
         })
     }
+
+    /// The SARIF report with the same evaluation metadata as the JSON envelope.
+    pub fn sarif_with_context(&self, context: &ReportContext) -> String {
+        serde_json::to_string_pretty(&self.sarif_value_with_context(context))
+            .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// The SARIF report value with evaluation identity and runtime metadata.
+    pub fn sarif_value_with_context(&self, context: &ReportContext) -> serde_json::Value {
+        let mut value = self.sarif_value();
+        if let Some(run) = value["runs"]
+            .as_array_mut()
+            .and_then(|runs| runs.first_mut())
+        {
+            run["properties"]["schemaVersion"] =
+                serde_json::Value::String(REPORT_SCHEMA_VERSION.to_string());
+            run["properties"]["evaluation"] = context_json(context, self.runs);
+        }
+        value
+    }
+}
+
+fn context_json(context: &ReportContext, runs: &[GateRun]) -> serde_json::Value {
+    let mut providers = Vec::new();
+    for run in runs {
+        if let Some(Origin::Embedded {
+            provider,
+            version,
+            analyzer_fingerprint,
+        }) = run.outcome.origin()
+        {
+            let identity = serde_json::json!({
+                "provider": provider,
+                "version": version,
+                "analyzerFingerprint": analyzer_fingerprint,
+            });
+            if !providers.contains(&identity) {
+                providers.push(identity);
+            }
+        }
+    }
+    serde_json::json!({
+        "baselineCommit": context.baseline_commit,
+        "candidateIdentity": context.candidate_identity,
+        "observationFingerprint": context.observation_fingerprint,
+        "contractFingerprint": context.contract_fingerprint,
+        "evaluatedAtUnix": context.evaluated_at_unix,
+        "platform": {"os": std::env::consts::OS, "architecture": std::env::consts::ARCH},
+        "toolchain": {"cargo": context.cargo_version, "externalTool": context.external_tool_version},
+        "allowedEnvironmentNames": context.allowed_environment_names,
+        "providers": providers,
+        "trustFailures": context.trust_failures,
+    })
 }
 
 fn outcome_name(o: &GateOutcome) -> &'static str {
