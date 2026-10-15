@@ -29,9 +29,13 @@ pub mod checks_green;
 pub mod external_tool;
 pub mod test_inventory;
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rulebound_orchestrate::{Origin, ToolId, UntrustworthyReason};
@@ -53,6 +57,10 @@ fn signal_of(status: &std::process::ExitStatus) -> i32 {
 /// that a finished tool is not noticeably delayed, and long enough that a
 /// run spawning several processes does not spend its time in `sleep`.
 const POLL: Duration = Duration::from_millis(10);
+/// Maximum bytes retained from each child output stream.
+pub const MAX_CAPTURED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+/// Marker appended when a child output stream exceeds the capture limit.
+pub const OUTPUT_TRUNCATION_MARKER: &str = "\n[rulebound: child output truncated]\n";
 
 /// The captured result of one delegated process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -63,6 +71,125 @@ pub struct Completed {
     pub stdout: String,
     /// Whatever it wrote to stderr, which is usually where diagnostics land.
     pub stderr: String,
+}
+
+/// Cooperative cancellation shared by callers and running child processes.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    /// Request cancellation.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Explicit environment inheritance and overrides for a child process.
+///
+/// The debug representation reports variable names only and never prints
+/// values, which may contain credentials.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct EnvironmentPolicy {
+    inherit_all: bool,
+    inherited: std::collections::BTreeSet<OsString>,
+    overrides: BTreeMap<OsString, OsString>,
+}
+
+impl std::fmt::Debug for EnvironmentPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvironmentPolicy")
+            .field("inherit_all", &self.inherit_all)
+            .field("inherited_names", &self.inherited_names())
+            .field("override_names", &self.overrides.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl EnvironmentPolicy {
+    fn inherited_names(&self) -> Vec<String> {
+        self.inherited
+            .iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    /// Inherit the complete parent environment.
+    pub fn inherit_all() -> Self {
+        Self {
+            inherit_all: true,
+            ..Self::default()
+        }
+    }
+
+    /// Start with an empty child environment and inherit only these names.
+    pub fn allowlist<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        Self {
+            inherited: names.into_iter().map(Into::into).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Add one parent environment variable to the inherited allowlist.
+    pub fn inherit(mut self, name: impl Into<OsString>) -> Self {
+        self.inherited.insert(name.into());
+        self
+    }
+
+    /// Set a child variable explicitly.
+    pub fn set(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.overrides.insert(name.into(), value.into());
+        self
+    }
+
+    /// Names of variables permitted or explicitly set, without their values.
+    pub fn allowed_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = if self.inherit_all {
+            std::env::vars_os()
+                .map(|(name, _)| name.to_string_lossy().into_owned())
+                .collect()
+        } else {
+            self.inherited
+                .iter()
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect()
+        };
+        names.extend(
+            self.overrides
+                .keys()
+                .map(|name| name.to_string_lossy().into_owned()),
+        );
+        names.extend(
+            ["CARGO_TERM_COLOR", "NO_COLOR", "CLICOLOR", "TERM", "SHELL"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn apply(&self, command: &mut Command) {
+        if !self.inherit_all {
+            command.env_clear();
+            for name in &self.inherited {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+        }
+        for (name, value) in &self.overrides {
+            command.env(name, value);
+        }
+    }
 }
 
 /// How a process finished, before any interpretation.
@@ -83,6 +210,8 @@ pub enum Outcome {
     TimedOut,
     /// The process could not be started at all.
     SpawnFailed,
+    /// The caller cancelled the process and it was terminated.
+    Cancelled,
 }
 
 impl Outcome {
@@ -120,7 +249,7 @@ impl Outcome {
                     Interpretation::NoTrustworthyResult
                 }
             }
-            Self::Signalled(_) | Self::TimedOut | Self::SpawnFailed => {
+            Self::Signalled(_) | Self::TimedOut | Self::SpawnFailed | Self::Cancelled => {
                 Interpretation::NoTrustworthyResult
             }
         }
@@ -199,6 +328,9 @@ impl Interpretation {
             (Self::NoTrustworthyResult, Outcome::SpawnFailed) => {
                 "tool could not be started; it is not installed or not executable".to_string()
             }
+            (Self::NoTrustworthyResult, Outcome::Cancelled) => {
+                "tool was cancelled by the caller".to_string()
+            }
         }
     }
 }
@@ -211,11 +343,132 @@ impl Interpretation {
 /// or dies is a *result*, because distinguishing it from a failure is the
 /// entire purpose of this crate. Only a programming error panics.
 pub fn run(program: &str, args: &[String], timeout: Duration) -> Completed {
-    let mut child = match Command::new(program)
+    run_at(program, args, timeout, None)
+}
+
+/// Run a program in an explicit working directory, capturing output with a
+/// hard timeout.
+///
+/// # Errors
+///
+/// Startup, timeout, and process failures are returned in [`Completed`],
+/// preserving the distinction between a failed check and a check that could
+/// not produce a trustworthy result.
+pub fn run_in(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    working_directory: &Path,
+) -> Completed {
+    run_at(program, args, timeout, Some(working_directory))
+}
+
+/// Run a program in an explicit working directory and environment policy.
+///
+/// # Errors
+///
+/// Startup, timeout, and process failures are returned in [`Completed`].
+pub fn run_in_with_environment(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    working_directory: &Path,
+    environment: &EnvironmentPolicy,
+) -> Completed {
+    run_at_with_environment(
+        program,
+        args,
+        timeout,
+        Some(working_directory),
+        Some(environment),
+    )
+}
+
+/// Run a child with explicit root, environment, and cooperative cancellation.
+pub fn run_in_with_environment_and_cancellation(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    working_directory: &Path,
+    environment: &EnvironmentPolicy,
+    cancellation: &CancellationToken,
+) -> Completed {
+    run_at_with_environment_and_cancellation(
+        program,
+        args,
+        timeout,
+        Some(working_directory),
+        Some(environment),
+        Some(cancellation),
+    )
+}
+
+/// Run a program with an explicit environment policy and inherited working
+/// directory.
+///
+/// # Errors
+///
+/// Startup, timeout, and process failures are returned in [`Completed`].
+pub fn run_with_environment(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    environment: &EnvironmentPolicy,
+) -> Completed {
+    run_at_with_environment(program, args, timeout, None, Some(environment))
+}
+
+fn run_at(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    working_directory: Option<&Path>,
+) -> Completed {
+    run_at_with_environment(program, args, timeout, working_directory, None)
+}
+
+fn run_at_with_environment(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    working_directory: Option<&Path>,
+    environment: Option<&EnvironmentPolicy>,
+) -> Completed {
+    run_at_with_environment_and_cancellation(
+        program,
+        args,
+        timeout,
+        working_directory,
+        environment,
+        None,
+    )
+}
+
+fn run_at_with_environment_and_cancellation(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    working_directory: Option<&Path>,
+    environment: Option<&EnvironmentPolicy>,
+    cancellation: Option<&CancellationToken>,
+) -> Completed {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Completed {
+            status: Outcome::Cancelled,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+    }
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(policy) = environment {
+        policy.apply(&mut command);
+    }
+    command
         // A delegated tool's colour codes end up inside a finding's `observed`
         // field, and a JSON or SARIF artefact full of escape sequences is not
         // machine-readable. Colour is a function of the terminal, and a report
@@ -226,9 +479,16 @@ pub fn run(program: &str, args: &[String], timeout: Duration) -> Completed {
         .env("TERM", "dumb")
         // An argument list is data, never a shell. `Command` does not use one,
         // and setting this makes that explicit to anything downstream.
-        .env("SHELL", "/bin/sh")
-        .spawn()
+        .env("SHELL", "/bin/sh");
+    if let Some(directory) = working_directory {
+        command.current_dir(directory);
+    }
+    #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(_) => {
             return Completed {
@@ -245,25 +505,19 @@ pub fn run(program: &str, args: &[String], timeout: Duration) -> Completed {
     // reading, which is the exact failure mode this crate exists to avoid.
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
-    let out_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = out_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        String::from_utf8_lossy(&buf).into_owned()
-    });
-    let err_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = err_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        String::from_utf8_lossy(&buf).into_owned()
-    });
+    let out_handle = std::thread::spawn(move || capture_output(out_pipe.as_mut()));
+    let err_handle = std::thread::spawn(move || capture_output(err_pipe.as_mut()));
 
     let deadline = Instant::now() + timeout;
     let outcome = loop {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            terminate_child_process_tree(&mut child);
+            let _ = child.wait();
+            break Outcome::Cancelled;
+        }
         match child.try_wait() {
             Ok(Some(s)) => {
+                terminate_child_process_tree(&mut child);
                 let outcome = if s.success() {
                     Outcome::Exited(0)
                 } else {
@@ -281,24 +535,71 @@ pub fn run(program: &str, args: &[String], timeout: Duration) -> Completed {
                 break outcome;
             }
             Ok(None) => {}
-            Err(_) => break Outcome::SpawnFailed,
+            Err(_) => {
+                terminate_child_process_tree(&mut child);
+                break Outcome::SpawnFailed;
+            }
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            terminate_child_process_tree(&mut child);
             let _ = child.wait();
             break Outcome::TimedOut;
         }
         std::thread::sleep(POLL);
     };
 
-    let stdout = out_handle.join().unwrap_or_default();
-    let stderr = err_handle.join().unwrap_or_default();
+    let (stdout, _) = out_handle.join().unwrap_or_default();
+    let (stderr, _) = err_handle.join().unwrap_or_default();
 
     Completed {
         status: outcome,
         stdout,
         stderr,
     }
+}
+
+fn terminate_child_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(process_group) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: `process_group(0)` created a group led by this child.
+            // A negative PID targets only that isolated group.
+            let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+            if result != 0 {
+                let _ = child.kill();
+            }
+        } else {
+            let _ = child.kill();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
+    }
+}
+
+fn capture_output(pipe: Option<&mut impl Read>) -> (String, bool) {
+    let mut output = Vec::with_capacity(MAX_CAPTURED_OUTPUT_BYTES);
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    if let Some(pipe) = pipe {
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    let remaining = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(output.len());
+                    let retained = count.min(remaining);
+                    output.extend_from_slice(&buffer[..retained]);
+                    truncated |= retained < count;
+                }
+            }
+        }
+    }
+    let mut text = String::from_utf8_lossy(&output).into_owned();
+    if truncated {
+        text.push_str(OUTPUT_TRUNCATION_MARKER);
+    }
+    (text, truncated)
 }
 
 /// Substitute `{base}`, `{head}` and `{index}` in a configured argument list.
@@ -447,6 +748,30 @@ mod tests {
             &["-c".to_string(), script.to_string()],
             Duration::from_secs(10),
         )
+    }
+
+    #[test]
+    fn oversized_child_output_is_drained_but_bounded_and_marked() {
+        let bytes = vec![b'x'; MAX_CAPTURED_OUTPUT_BYTES + 1];
+        let mut reader = std::io::Cursor::new(bytes);
+        let (captured, truncated) = capture_output(Some(&mut reader));
+
+        assert!(truncated);
+        assert!(captured.ends_with(OUTPUT_TRUNCATION_MARKER));
+        assert_eq!(
+            captured.len(),
+            MAX_CAPTURED_OUTPUT_BYTES + OUTPUT_TRUNCATION_MARKER.len()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_command_cleans_up_pipe_holding_descendants() {
+        let started = Instant::now();
+        let completed = sh("sleep 30 & exit 0");
+
+        assert_eq!(completed.status, Outcome::Exited(0));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

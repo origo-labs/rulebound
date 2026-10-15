@@ -19,10 +19,10 @@ use rulebound_contract::{Contract, GateId, Primitive, Severity};
 
 /// Who produced a verdict.
 ///
-/// `Delegated` is constructible only by `rulebound-exec`, and `Judged` is not
-/// in this enum at all: a judgement can only ever be a `Fail` at escalate
-/// severity, so "a model said this is fine" is not expressible as a pass. That
-/// is the type system, not a convention.
+/// `Delegated` identifies a process provider and `Embedded` identifies a
+/// registered Rust analyzer. `Judged` is not in this enum: a judgement can
+/// only ever be a `Fail` at escalate severity, so "a model said this is fine"
+/// is not expressible as a pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     /// Rulebound's own AST or diff analysis.
@@ -37,6 +37,19 @@ pub enum Origin {
         /// The tool version, so a finding is reproducible against a known
         /// implementation.
         version: String,
+    },
+    /// A registered Rust analyzer running inside Rulebound.
+    Embedded {
+        /// The registration identifier from the contract.
+        provider: String,
+        /// Provider implementation version.
+        version: String,
+        /// Fingerprint identifying the analyzer implementation.
+        analyzer_fingerprint: String,
+        /// Analyzer engine or model identity.
+        analyzer_identity: String,
+        /// Fingerprint of the effective provider policy.
+        effective_policy_fingerprint: String,
     },
 }
 
@@ -84,6 +97,39 @@ pub enum UntrustworthyReason {
         /// What happened, in one sentence.
         detail: String,
     },
+    /// A gate declared a provider that was not registered for this run.
+    ProviderUnavailable {
+        /// The provider identifier from the contract.
+        provider: String,
+    },
+    /// The provider requires configuration that the gate did not declare.
+    ProviderConfigurationRequired {
+        /// The provider identifier.
+        provider: String,
+    },
+    /// The declared provider policy could not be parsed or validated.
+    ProviderInvalidPolicy {
+        /// The provider identifier.
+        provider: String,
+        /// Policy validation details.
+        detail: String,
+    },
+    /// A provider returned incomplete required coverage.
+    ProviderCoverageIncomplete {
+        /// The provider identifier.
+        provider: String,
+        /// Coverage details.
+        detail: String,
+    },
+    /// A provider could not use a supplied baseline index or artifact.
+    ProviderArtifactIncompatible {
+        /// The provider identifier.
+        provider: String,
+        /// Incompatibility details.
+        detail: String,
+    },
+    /// Evaluation or provider analysis was cancelled cooperatively.
+    Cancelled,
     /// A gate could not decide, e.g. a file it needed to parse did not parse.
     Indeterminate {
         /// What prevented a decision.
@@ -111,6 +157,12 @@ impl UntrustworthyReason {
             Self::ToolCouldNotRun { detail }
             | Self::Indeterminate { detail }
             | Self::ContractInvalid { detail } => detail,
+            Self::ProviderUnavailable { provider } => provider,
+            Self::ProviderConfigurationRequired { provider } => provider,
+            Self::ProviderInvalidPolicy { detail, .. } => detail,
+            Self::ProviderCoverageIncomplete { detail, .. }
+            | Self::ProviderArtifactIncompatible { detail, .. } => detail,
+            Self::Cancelled => "evaluation was cancelled",
             Self::Unimplemented { primitive } => primitive.as_str(),
         }
     }
@@ -134,6 +186,9 @@ pub enum SkipReason {
 /// construction: a gate that cannot produce a trustworthy verdict has to say
 /// which of the non-pass variants it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Findings are evidence values kept inline for simple exhaustive matching;
+// boxing them would change this public outcome API.
+#[allow(clippy::large_enum_variant)]
 pub enum GateOutcome {
     /// The gate ran and found nothing it reports. Compatible with accept.
     Pass {
@@ -261,6 +316,39 @@ pub struct Finding {
     pub fingerprint: Fingerprint,
     /// Who produced it, derived from the producing outcome.
     pub origin: Origin,
+    /// Original analyzer fields retained when Rulebound maps an embedded
+    /// provider finding into its own consequence and verdict types.
+    pub embedded_metadata: Option<EmbeddedFindingMetadata>,
+}
+
+/// Analyzer metadata that Rulebound preserves alongside an embedded finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedFindingMetadata {
+    /// Provider's original rule identifier.
+    pub rule_id: String,
+    /// Provider's original stable finding fingerprint.
+    pub source_fingerprint: String,
+    /// Provider's original severity spelling.
+    pub source_severity: String,
+    /// Analyzer identity associated with the finding.
+    pub analyzer_identity: String,
+    /// Fingerprint of the effective provider policy used for this run.
+    pub effective_policy_fingerprint: String,
+    /// Additional source locations supplied by the provider.
+    pub related_locations: Vec<RelatedLocation>,
+}
+
+/// A provider supplied related source location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedLocation {
+    /// Repository-relative path.
+    pub path: String,
+    /// First 1-based source line, if known.
+    pub start_line: Option<u32>,
+    /// Last 1-based source line, if known.
+    pub end_line: Option<u32>,
+    /// Provider's description of the relationship.
+    pub message: Option<String>,
 }
 
 /// What a finding is about.
@@ -310,6 +398,8 @@ pub enum SubjectKind {
     Check,
     /// The contract itself.
     Contract,
+    /// A rule declared by an embedded analyzer.
+    EmbeddedRule,
 }
 
 impl SubjectKind {
@@ -326,6 +416,7 @@ impl SubjectKind {
             Self::Path => "path",
             Self::Check => "check",
             Self::Contract => "contract",
+            Self::EmbeddedRule => "embedded rule",
         }
     }
 }
@@ -486,7 +577,15 @@ impl Finding {
             message: message.into(),
             fingerprint,
             origin,
+            embedded_metadata: None,
         }
+    }
+
+    /// Attach original embedded analyzer fields without changing Rulebound's
+    /// finding fingerprint or verdict consequence.
+    pub fn with_embedded_metadata(mut self, metadata: EmbeddedFindingMetadata) -> Self {
+        self.embedded_metadata = Some(metadata);
+        self
     }
 
     /// What kind of change this finding describes, derived from the two sides.
@@ -725,8 +824,46 @@ pub struct GateRun {
     pub primitive: Primitive,
     /// Every finding, uncollapsed and in the order the gate produced them.
     pub findings: Vec<Finding>,
+    /// Declared input coverage, when the check reports it.
+    pub coverage: Option<GateCoverage>,
+    /// Child process evidence collected by delegated checks.
+    pub commands: Vec<CommandEvidence>,
     /// The single outcome the verdict algebra sees.
     pub outcome: GateOutcome,
+}
+
+/// Captured evidence for one delegated child process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandEvidence {
+    /// Executable name or path supplied to the process launcher.
+    pub program: String,
+    /// Arguments passed without shell interpolation.
+    pub args: Vec<String>,
+    /// Working directory, when explicitly set.
+    pub working_directory: Option<String>,
+    /// Process outcome before the gate interpreted its output.
+    pub outcome: String,
+    /// Wall time from launch through process completion, in milliseconds.
+    pub elapsed_millis: u128,
+    /// Allowed environment variable names. Values are never recorded.
+    pub environment_names: Vec<String>,
+    /// Captured standard output returned by the process.
+    pub stdout: String,
+    /// Captured standard error returned by the process.
+    pub stderr: String,
+    /// Whether captured output was truncated by the process adapter.
+    pub output_truncated: bool,
+}
+
+/// Coverage evidence supplied by an analyzed gate or embedded provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateCoverage {
+    /// Paths the check inspected.
+    pub inspected_paths: Vec<String>,
+    /// Paths required for a complete result.
+    pub required_paths: Vec<String>,
+    /// Whether analysis completed across the declared required paths.
+    pub complete: bool,
 }
 
 impl GateRun {
@@ -736,6 +873,8 @@ impl GateRun {
             gate_id,
             primitive,
             findings: Vec::new(),
+            coverage: None,
+            commands: Vec::new(),
             outcome: GateOutcome::Pass { origin },
         }
     }
@@ -747,6 +886,8 @@ impl GateRun {
             gate_id,
             primitive,
             findings: Vec::new(),
+            coverage: None,
+            commands: Vec::new(),
             outcome: GateOutcome::Skipped {
                 reason: SkipReason::DeclaredOff,
             },
@@ -764,6 +905,8 @@ impl GateRun {
             gate_id,
             primitive,
             findings: Vec::new(),
+            coverage: None,
+            commands: Vec::new(),
             outcome: GateOutcome::Untrustworthy { reason, origin },
         }
     }
@@ -784,6 +927,8 @@ impl GateRun {
             gate_id,
             primitive,
             findings,
+            coverage: None,
+            commands: Vec::new(),
             outcome,
         }
     }
@@ -814,6 +959,8 @@ fn severity_rank(s: Severity) -> u8 {
 pub struct GateRunBuilder {
     findings: Vec<Finding>,
     untrustworthy: Option<UntrustworthyReason>,
+    coverage: Option<GateCoverage>,
+    commands: Vec<CommandEvidence>,
 }
 
 impl GateRunBuilder {
@@ -835,6 +982,16 @@ impl GateRunBuilder {
         }
     }
 
+    /// Attach coverage evidence to the resulting run.
+    pub fn coverage(&mut self, coverage: GateCoverage) {
+        self.coverage = Some(coverage);
+    }
+
+    /// Attach captured process evidence to the resulting run.
+    pub fn command(&mut self, command: CommandEvidence) {
+        self.commands.push(command);
+    }
+
     /// Whether any finding has been recorded.
     pub fn has_findings(&self) -> bool {
         !self.findings.is_empty()
@@ -847,10 +1004,15 @@ impl GateRunBuilder {
                 gate_id,
                 primitive,
                 findings: self.findings,
+                coverage: self.coverage,
+                commands: self.commands,
                 outcome: GateOutcome::Untrustworthy { reason, origin },
             };
         }
-        GateRun::with_findings(gate_id, primitive, self.findings, origin)
+        let mut run = GateRun::with_findings(gate_id, primitive, self.findings, origin);
+        run.coverage = self.coverage;
+        run.commands = self.commands;
+        run
     }
 }
 

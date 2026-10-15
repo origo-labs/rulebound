@@ -29,6 +29,63 @@ pub const TOOL_NAME: &str = "rulebound";
 pub const SARIF_VERSION: &str = "2.1.0";
 /// The partialFingerprint key carrying [`Finding::fingerprint`].
 pub const FINGERPRINT_KEY: &str = "ruleboundFingerprint/v1";
+/// Version of the stable serialized report envelope.
+pub const REPORT_SCHEMA_VERSION: &str = "1.0";
+
+/// Evaluation metadata added to a rendered report envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReportContext {
+    /// Resolved baseline commit identifier.
+    pub baseline_commit: String,
+    /// Full candidate snapshot identity.
+    pub candidate_identity: Option<String>,
+    /// Fingerprint of the complete observation.
+    pub observation_fingerprint: Option<String>,
+    /// Fingerprint of the original contract bytes.
+    pub contract_fingerprint: Option<String>,
+    /// Changed paths and their full-content identity evidence.
+    pub changed_files: Vec<FileEvidence>,
+    /// Identities of caller-declared ignored execution inputs.
+    pub ignored_execution_inputs: Vec<IgnoredInputEvidence>,
+    /// Bounded, human-readable observation diff.
+    pub rendered_diff: String,
+    /// Whether the observation diff was clipped.
+    pub rendered_diff_truncated: bool,
+    /// Caller supplied Unix timestamp for the evaluation.
+    pub evaluated_at_unix: i64,
+    /// Cargo version used for delegated checks.
+    pub cargo_version: String,
+    /// External tool version used for delegated checks.
+    pub external_tool_version: String,
+    /// Environment variable names permitted for child processes.
+    pub allowed_environment_names: Vec<String>,
+    /// Snapshot trust failures discovered during evaluation.
+    pub trust_failures: Vec<String>,
+}
+
+/// Full-content identity evidence for one changed path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEvidence {
+    /// Repository-relative path.
+    pub path: String,
+    /// Baseline content digest, when the path existed.
+    pub baseline_digest: Option<String>,
+    /// Candidate content digest, when the path exists.
+    pub candidate_digest: Option<String>,
+    /// Baseline snapshot mode, when available.
+    pub baseline_mode: Option<u32>,
+    /// Candidate snapshot mode, when available.
+    pub candidate_mode: Option<u32>,
+}
+
+/// Identity evidence for an ignored execution input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredInputEvidence {
+    /// Repository-relative input path.
+    pub path: String,
+    /// Digest of the path and all entries beneath it.
+    pub digest: String,
+}
 
 /// The three targets, as top-level JSON keys.
 ///
@@ -109,6 +166,24 @@ impl Report<'_> {
                     }
                 }
             }
+            if let Some(coverage) = &run.coverage {
+                out.push_str(&format!(
+                    "           coverage: {} ({} inspected, {} required)\n",
+                    if coverage.complete {
+                        "complete"
+                    } else {
+                        "incomplete"
+                    },
+                    coverage.inspected_paths.len(),
+                    coverage.required_paths.len(),
+                ));
+            }
+            for command in &run.commands {
+                out.push_str(&format!(
+                    "           command: {} {:?} ({}, {} ms)\n",
+                    command.program, command.args, command.outcome, command.elapsed_millis,
+                ));
+            }
         }
         out.push('\n');
         out.push_str(&format!("verdict: {}\n", self.verdict));
@@ -131,6 +206,37 @@ impl Report<'_> {
                 .unwrap_or("<none>")
         ));
         out
+    }
+
+    /// The human report with its evaluation identity and runtime metadata.
+    pub fn human_with_context(&self, context: &ReportContext) -> String {
+        let mut output = self.human();
+        output.push_str(&format!(
+            "schema_version: {REPORT_SCHEMA_VERSION}\nbaseline_commit: {}\n",
+            context.baseline_commit
+        ));
+        output.push_str(&format!(
+            "changed_files: {} (diff truncated: {})\n",
+            context.changed_files.len(),
+            context.rendered_diff_truncated,
+        ));
+        for file in &context.changed_files {
+            output.push_str(&format!("  - {}\n", file.path));
+        }
+        output.push_str(&format!(
+            "candidate_identity: {}\nobservation_fingerprint: {}\ncontract_fingerprint: {}\nevaluated_at_unix: {}\n",
+            context.candidate_identity.as_deref().unwrap_or("<unavailable>"),
+            context.observation_fingerprint.as_deref().unwrap_or("<unavailable>"),
+            context.contract_fingerprint.as_deref().unwrap_or("<unavailable>"),
+            context.evaluated_at_unix,
+        ));
+        if !context.trust_failures.is_empty() {
+            output.push_str("trust_failures:\n");
+            for failure in &context.trust_failures {
+                output.push_str(&format!("  - {failure}\n"));
+            }
+        }
+        output
     }
 
     /// The JSON report. The three targets are separate top-level keys.
@@ -164,6 +270,15 @@ impl Report<'_> {
                 outcome: outcome_name(&r.outcome),
                 origin: r.outcome.origin().map(origin_json),
                 finding_count: r.findings.len(),
+                commands: r.commands.iter().map(command_json).collect(),
+                detail: outcome_detail(&r.outcome),
+                coverage: r.coverage.as_ref().map(|coverage| {
+                    serde_json::json!({
+                        "inspectedPaths": coverage.inspected_paths,
+                        "requiredPaths": coverage.required_paths,
+                        "complete": coverage.complete,
+                    })
+                }),
             })
             .collect();
         gates.sort_by(|a, b| a.gate_id.cmp(&b.gate_id));
@@ -174,6 +289,7 @@ impl Report<'_> {
             JSON_TARGET_KEYS[0]: {
                 "verdict": self.verdict.to_string(),
                 "exit_code": self.verdict.exit_code(),
+                "rulebound_version": self.tool_version,
                 "gates": gates,
                 "budget_bytes": self.contract.budget_observation_bytes,
                 "baseline": self.contract.baseline_ref,
@@ -196,6 +312,20 @@ impl Report<'_> {
                 "reviewed": self.contract.judgement.reviewed,
             },
         })
+    }
+
+    /// The JSON report with its versioned evaluation envelope.
+    pub fn json_with_context(&self, context: &ReportContext) -> String {
+        serde_json::to_string_pretty(&self.json_value_with_context(context))
+            .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// The JSON report value with evaluation identity and runtime metadata.
+    pub fn json_value_with_context(&self, context: &ReportContext) -> serde_json::Value {
+        let mut value = self.json_value();
+        value["schemaVersion"] = serde_json::Value::String(REPORT_SCHEMA_VERSION.to_string());
+        value["evaluation"] = context_json(context, self.runs, self.tool_version);
+        value
     }
 
     /// The SARIF 2.1.0 report.
@@ -270,16 +400,110 @@ impl Report<'_> {
                 // what was not checked without opening the contract.
                 "properties": {
                     "verdict": self.verdict.to_string(),
+                    "exitCode": self.verdict.exit_code(),
+                    "ruleboundVersion": self.tool_version,
                     "notCovered": self.contract.judgement.not_covered,
                     "reviewed": self.contract.judgement.reviewed,
                     // The gates that audit the contract are not in the
                     // contract. Saying so in the artefact stops a reader
                     // wondering where they were configured.
                     "builtInGates": ["contract_not_loosened", "contract_review_stale"],
+                    "gateOutcomes": self.runs.iter().map(|run| serde_json::json!({
+                        "gateId": run.gate_id.to_string(),
+                        "primitive": run.primitive.to_string(),
+                        "outcome": outcome_name(&run.outcome),
+                        "detail": outcome_detail(&run.outcome),
+                        "origin": run.outcome.origin().map(origin_json),
+                        "findingCount": run.findings.len(),
+                        "commands": run.commands.iter().map(command_json).collect::<Vec<_>>(),
+                    })).collect::<Vec<_>>(),
+                "gateCoverage": self.runs.iter().filter_map(|run| {
+                    run.coverage.as_ref().map(|coverage| (
+                        run.gate_id.to_string(),
+                        serde_json::json!({
+                            "inspectedPaths": coverage.inspected_paths,
+                            "requiredPaths": coverage.required_paths,
+                            "complete": coverage.complete,
+                        }),
+                    ))
+                }).collect::<serde_json::Map<_, _>>(),
                 },
             }],
         })
     }
+
+    /// The SARIF report with the same evaluation metadata as the JSON envelope.
+    pub fn sarif_with_context(&self, context: &ReportContext) -> String {
+        serde_json::to_string_pretty(&self.sarif_value_with_context(context))
+            .unwrap_or_else(|_| "{}".to_string())
+    }
+
+    /// The SARIF report value with evaluation identity and runtime metadata.
+    pub fn sarif_value_with_context(&self, context: &ReportContext) -> serde_json::Value {
+        let mut value = self.sarif_value();
+        if let Some(run) = value["runs"]
+            .as_array_mut()
+            .and_then(|runs| runs.first_mut())
+        {
+            run["properties"]["schemaVersion"] =
+                serde_json::Value::String(REPORT_SCHEMA_VERSION.to_string());
+            run["properties"]["evaluation"] = context_json(context, self.runs, self.tool_version);
+        }
+        value
+    }
+}
+
+fn context_json(context: &ReportContext, runs: &[GateRun], version: &str) -> serde_json::Value {
+    let mut providers = Vec::new();
+    for run in runs {
+        if let Some(Origin::Embedded {
+            provider,
+            version,
+            analyzer_fingerprint,
+            analyzer_identity,
+            effective_policy_fingerprint,
+        }) = run.outcome.origin()
+        {
+            let identity = serde_json::json!({
+                "provider": provider,
+                "version": version,
+                "analyzerFingerprint": analyzer_fingerprint,
+                "analyzerIdentity": analyzer_identity,
+                "effectivePolicyFingerprint": effective_policy_fingerprint,
+            });
+            if !providers.contains(&identity) {
+                providers.push(identity);
+            }
+        }
+    }
+    serde_json::json!({
+        "baselineCommit": context.baseline_commit,
+        "ruleboundVersion": version,
+        "candidateIdentity": context.candidate_identity,
+        "observationFingerprint": context.observation_fingerprint,
+        "contractFingerprint": context.contract_fingerprint,
+        "changedFiles": context.changed_files.iter().map(|file| serde_json::json!({
+            "path": file.path,
+            "baselineDigest": file.baseline_digest,
+            "candidateDigest": file.candidate_digest,
+            "baselineMode": file.baseline_mode,
+            "candidateMode": file.candidate_mode,
+        })).collect::<Vec<_>>(),
+        "ignoredExecutionInputs": context.ignored_execution_inputs.iter().map(|input| serde_json::json!({
+            "path": input.path,
+            "digest": input.digest,
+        })).collect::<Vec<_>>(),
+        "diff": {
+            "text": context.rendered_diff,
+            "truncated": context.rendered_diff_truncated,
+        },
+        "evaluatedAtUnix": context.evaluated_at_unix,
+        "platform": {"os": std::env::consts::OS, "architecture": std::env::consts::ARCH},
+        "toolchain": {"cargo": context.cargo_version, "externalTool": context.external_tool_version},
+        "allowedEnvironmentNames": context.allowed_environment_names,
+        "providers": providers,
+        "trustFailures": context.trust_failures,
+    })
 }
 
 fn outcome_name(o: &GateOutcome) -> &'static str {
@@ -302,6 +526,20 @@ fn origin_json(origin: &Origin) -> serde_json::Value {
             "tool": tool.as_str(),
             "version": version,
         }),
+        Origin::Embedded {
+            provider,
+            version,
+            analyzer_fingerprint,
+            analyzer_identity,
+            effective_policy_fingerprint,
+        } => serde_json::json!({
+            "kind": "embedded",
+            "provider": provider,
+            "version": version,
+            "analyzerFingerprint": analyzer_fingerprint,
+            "analyzerIdentity": analyzer_identity,
+            "effectivePolicyFingerprint": effective_policy_fingerprint,
+        }),
     }
 }
 
@@ -319,6 +557,27 @@ fn finding_json(f: &Finding) -> serde_json::Value {
         "message": f.message,
         "fingerprint": f.fingerprint.to_string(),
         "origin": origin_json(&f.origin),
+        "embeddedFinding": f.embedded_metadata.as_ref().map(embedded_metadata_json),
+    })
+}
+
+fn embedded_metadata_json(
+    metadata: &rulebound_orchestrate::EmbeddedFindingMetadata,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ruleId": metadata.rule_id,
+        "fingerprint": metadata.source_fingerprint,
+        "sourceSeverity": metadata.source_severity,
+        "analyzerIdentity": metadata.analyzer_identity,
+        "effectivePolicyFingerprint": metadata.effective_policy_fingerprint,
+        "relatedLocations": metadata.related_locations.iter().map(|location| {
+            serde_json::json!({
+                "path": location.path,
+                "startLine": location.start_line,
+                "endLine": location.end_line,
+                "message": location.message,
+            })
+        }).collect::<Vec<_>>(),
     })
 }
 
@@ -349,7 +608,7 @@ fn result_json(f: &Finding, rule_id: &str, rule_index: usize) -> serde_json::Val
             "endLine": h.end + 1,
         });
     }
-    serde_json::json!({
+    let mut result = serde_json::json!({
         "ruleId": rule_id,
         "ruleIndex": rule_index,
         "level": level,
@@ -368,7 +627,34 @@ fn result_json(f: &Finding, rule_id: &str, rule_index: usize) -> serde_json::Val
             "origin": origin_json(&f.origin),
             "hunkInclusiveEnd": f.hunk.map(|h| h.end),
         },
-    })
+    });
+    if let Some(metadata) = &f.embedded_metadata {
+        result["properties"]["embeddedFinding"] = embedded_metadata_json(metadata);
+        result["relatedLocations"] = serde_json::Value::Array(
+            metadata
+                .related_locations
+                .iter()
+                .enumerate()
+                .map(|(index, location)| {
+                    let mut physical = serde_json::json!({
+                        "artifactLocation": {"uri": location.path},
+                    });
+                    if let Some(start) = location.start_line {
+                        physical["region"] = serde_json::json!({
+                            "startLine": start,
+                            "endLine": location.end_line.unwrap_or(start) + 1,
+                        });
+                    }
+                    serde_json::json!({
+                        "id": index + 1,
+                        "message": {"text": location.message.as_deref().unwrap_or("Related location")},
+                        "physicalLocation": physical,
+                    })
+                })
+                .collect(),
+        );
+    }
+    result
 }
 
 #[derive(Debug, Serialize)]
@@ -393,4 +679,38 @@ struct GateJson {
     origin: Option<serde_json::Value>,
     #[serde(rename = "findingCount")]
     finding_count: usize,
+    commands: Vec<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<serde_json::Value>,
+}
+
+fn command_json(command: &rulebound_orchestrate::CommandEvidence) -> serde_json::Value {
+    serde_json::json!({
+        "program": command.program,
+        "args": command.args,
+        "workingDirectory": command.working_directory,
+        "outcome": command.outcome,
+        "elapsedMilliseconds": command.elapsed_millis,
+        "environmentNames": command.environment_names,
+        "stdout": command.stdout,
+        "stderr": command.stderr,
+        "outputTruncated": command.output_truncated,
+    })
+}
+
+fn outcome_detail(outcome: &GateOutcome) -> Option<serde_json::Value> {
+    match outcome {
+        GateOutcome::Untrustworthy { reason, .. } => Some(serde_json::json!({
+            "kind": "untrustworthy",
+            "reason": format!("{reason:?}"),
+            "detail": reason.detail(),
+        })),
+        GateOutcome::Skipped { reason } => Some(serde_json::json!({
+            "kind": "skipped",
+            "reason": format!("{reason:?}"),
+        })),
+        GateOutcome::Pass { .. } | GateOutcome::Fail(_) => None,
+    }
 }

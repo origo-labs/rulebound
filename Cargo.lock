@@ -287,15 +287,16 @@ dependencies = [
 name = "rulebound-cli"
 version = "0.2.0-beta.1"
 dependencies = [
+ "blake3",
  "camino",
  "clap",
  "rulebound-contract",
  "rulebound-exec",
- "rulebound-gates",
  "rulebound-git",
  "rulebound-observe",
  "rulebound-orchestrate",
  "rulebound-report",
+ "rulebound-service",
  "toml",
 ]
 
@@ -312,6 +313,7 @@ name = "rulebound-exec"
 version = "0.2.0-beta.1"
 dependencies = [
  "camino",
+ "libc",
  "rulebound-contract",
  "rulebound-orchestrate",
  "serde_json",
@@ -342,6 +344,7 @@ dependencies = [
 name = "rulebound-observe"
 version = "0.2.0-beta.1"
 dependencies = [
+ "blake3",
  "rulebound-git",
  "rulebound-testkit",
 ]
@@ -364,6 +367,19 @@ dependencies = [
  "rulebound-orchestrate",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "rulebound-service"
+version = "0.2.0-beta.1"
+dependencies = [
+ "blake3",
+ "camino",
+ "rulebound-contract",
+ "rulebound-exec",
+ "rulebound-gates",
+ "rulebound-observe",
+ "rulebound-orchestrate",
 ]
 
 [[package]]

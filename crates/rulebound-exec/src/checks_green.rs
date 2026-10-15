@@ -13,11 +13,13 @@
 //! one. Collapsing these to a single result throws away exactly the evidence
 //! PRD 7 requires a block to carry.
 
+use std::path::Path;
 use std::time::Duration;
 
 use rulebound_orchestrate::{Finding, GateRunBuilder, Origin, Side, Subject, SubjectKind};
 
-use crate::{Completed, Interpretation, run};
+use crate::EnvironmentPolicy;
+use crate::{Completed, Interpretation};
 
 /// One of the three checks, and what its name is in a finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -68,21 +70,111 @@ pub fn run_checks(
     rulebound_orchestrate::GateRun,
     crate::test_inventory::TestInventory,
 ) {
+    run_checks_at(origin, timeout, None, None, None)
+}
+
+/// Run the built-in Cargo checks in a supplied project root.
+///
+/// # Errors
+///
+/// Process startup and check failures remain typed in the returned gate run.
+pub fn run_checks_in(
+    origin: Origin,
+    timeout: Duration,
+    working_directory: &Path,
+) -> (
+    rulebound_orchestrate::GateRun,
+    crate::test_inventory::TestInventory,
+) {
+    run_checks_at(origin, timeout, Some(working_directory), None, None)
+}
+
+/// Run the built-in Cargo checks with explicit working directory and
+/// environment policy.
+///
+/// # Errors
+///
+/// Process startup and check failures remain typed in the returned gate run.
+pub fn run_checks_in_with_environment(
+    origin: Origin,
+    timeout: Duration,
+    working_directory: &Path,
+    environment: &EnvironmentPolicy,
+) -> (
+    rulebound_orchestrate::GateRun,
+    crate::test_inventory::TestInventory,
+) {
+    run_checks_at(
+        origin,
+        timeout,
+        Some(working_directory),
+        Some(environment),
+        None,
+    )
+}
+
+/// Run Cargo checks with explicit root, environment, and cooperative cancellation.
+pub fn run_checks_in_with_environment_and_cancellation(
+    origin: Origin,
+    timeout: Duration,
+    working_directory: &Path,
+    environment: &EnvironmentPolicy,
+    cancellation: &crate::CancellationToken,
+) -> (
+    rulebound_orchestrate::GateRun,
+    crate::test_inventory::TestInventory,
+) {
+    run_checks_at(
+        origin,
+        timeout,
+        Some(working_directory),
+        Some(environment),
+        Some(cancellation),
+    )
+}
+
+fn run_checks_at(
+    origin: Origin,
+    timeout: Duration,
+    working_directory: Option<&Path>,
+    environment: Option<&EnvironmentPolicy>,
+    cancellation: Option<&crate::CancellationToken>,
+) -> (
+    rulebound_orchestrate::GateRun,
+    crate::test_inventory::TestInventory,
+) {
     let mut builder = GateRunBuilder::new();
     for check in Check::ALL {
-        apply(
-            &mut builder,
-            check,
-            run("cargo", &check.argv(), timeout),
-            &origin,
-        );
+        let args = check.argv();
+        let started = std::time::Instant::now();
+        let completed = run_cargo(&args, timeout, working_directory, environment, cancellation);
+        builder.command(rulebound_orchestrate::CommandEvidence {
+            program: "cargo".to_string(),
+            args,
+            working_directory: working_directory.map(|path| path.display().to_string()),
+            outcome: format!("{:?}", completed.status),
+            elapsed_millis: started.elapsed().as_millis(),
+            environment_names: environment.map_or_else(Vec::new, EnvironmentPolicy::allowed_names),
+            stdout: completed.stdout.clone(),
+            stderr: completed.stderr.clone(),
+            output_truncated: completed.stdout.contains(crate::OUTPUT_TRUNCATION_MARKER)
+                || completed.stderr.contains(crate::OUTPUT_TRUNCATION_MARKER),
+        });
+        apply(&mut builder, check, completed, &origin);
     }
+    let inventory = list_tests(
+        timeout,
+        working_directory,
+        environment,
+        cancellation,
+        &mut builder,
+    );
     let run = builder.finish(
         rulebound_contract::GateId::new("checks_green").expect("constant is valid"),
         rulebound_contract::Primitive::ChecksGreen,
         origin,
     );
-    (run, list_tests(timeout))
+    (run, inventory)
 }
 
 /// The test inventory: `cargo test -- --list`.
@@ -92,12 +184,28 @@ pub fn run_checks(
 /// `--list` output already contains. A supervisor that runs a test suite it was
 /// not asked to run is a different product with a different failure mode — and
 /// `checks_green` runs the suite anyway, as its own job.
-fn list_tests(timeout: Duration) -> crate::test_inventory::TestInventory {
-    let completed = run(
-        "cargo",
-        &["test".to_string(), "--".to_string(), "--list".to_string()],
-        timeout,
-    );
+fn list_tests(
+    timeout: Duration,
+    working_directory: Option<&Path>,
+    environment: Option<&EnvironmentPolicy>,
+    cancellation: Option<&crate::CancellationToken>,
+    builder: &mut GateRunBuilder,
+) -> crate::test_inventory::TestInventory {
+    let args = ["test".to_string(), "--".to_string(), "--list".to_string()];
+    let started = std::time::Instant::now();
+    let completed = run_cargo(&args, timeout, working_directory, environment, cancellation);
+    builder.command(rulebound_orchestrate::CommandEvidence {
+        program: "cargo".to_string(),
+        args: args.to_vec(),
+        working_directory: working_directory.map(|path| path.display().to_string()),
+        outcome: format!("{:?}", completed.status),
+        elapsed_millis: started.elapsed().as_millis(),
+        environment_names: environment.map_or_else(Vec::new, EnvironmentPolicy::allowed_names),
+        stdout: completed.stdout.clone(),
+        stderr: completed.stderr.clone(),
+        output_truncated: completed.stdout.contains(crate::OUTPUT_TRUNCATION_MARKER)
+            || completed.stderr.contains(crate::OUTPUT_TRUNCATION_MARKER),
+    });
     // An inventory we could not read is an empty one, and the consuming gate
     // has to be able to tell that from a build with no tests. `checks_green`
     // already reported the failure against the `test` check; the gate that
@@ -112,6 +220,29 @@ fn list_tests(timeout: Duration) -> crate::test_inventory::TestInventory {
     crate::test_inventory::TestInventory::parse(&completed.stdout).0
 }
 
+fn run_cargo(
+    args: &[String],
+    timeout: Duration,
+    working_directory: Option<&Path>,
+    environment: Option<&EnvironmentPolicy>,
+    cancellation: Option<&crate::CancellationToken>,
+) -> Completed {
+    if let (Some(path), Some(policy), Some(token)) = (working_directory, environment, cancellation)
+    {
+        return crate::run_in_with_environment_and_cancellation(
+            "cargo", args, timeout, path, policy, token,
+        );
+    }
+    match (working_directory, environment) {
+        (Some(path), Some(policy)) => {
+            crate::run_in_with_environment("cargo", args, timeout, path, policy)
+        }
+        (Some(path), None) => crate::run_in("cargo", args, timeout, path),
+        (None, Some(policy)) => crate::run_with_environment("cargo", args, timeout, policy),
+        (None, None) => crate::run("cargo", args, timeout),
+    }
+}
+
 /// Fold one command's result into the run.
 fn apply(builder: &mut GateRunBuilder, check: Check, completed: Completed, origin: &Origin) {
     match completed
@@ -123,15 +254,17 @@ fn apply(builder: &mut GateRunBuilder, check: Check, completed: Completed, origi
             // The row that matters. A tool that could not run has not passed,
             // and reporting that as a clippy failure would send a user hunting
             // for a lint that does not exist.
-            builder.untrustworthy(
+            builder.untrustworthy(if completed.status == crate::Outcome::Cancelled {
+                rulebound_orchestrate::UntrustworthyReason::Cancelled
+            } else {
                 rulebound_orchestrate::UntrustworthyReason::ToolCouldNotRun {
                     detail: format!(
                         "cargo {}: {}",
                         check.as_str(),
                         Interpretation::NoTrustworthyResult.describe(completed.status)
                     ),
-                },
-            );
+                }
+            });
         }
         Interpretation::Failed => {
             let diagnostics = first_diagnostics(&completed, 5);

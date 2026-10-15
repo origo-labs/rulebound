@@ -24,6 +24,7 @@ pub fn analyzed(p: Primitive) -> Option<AnalyzedGate> {
         Primitive::SuppressionsNotWidened => Some(crate::suppressions::run),
         Primitive::SecretAbsent => None, // M1.5
         Primitive::ChecksGreen | Primitive::ExternalTool => None, // M3, Delegated
+        Primitive::Embedded => None,     // Embedded providers run in rulebound-service.
         Primitive::Judged => None,       // M6, escalate-only
         Primitive::ContractNotLoosened => Some(crate::contract_not_loosened::run),
         Primitive::ContractReviewStale => Some(crate::contract_review_stale::run),

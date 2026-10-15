@@ -14,6 +14,7 @@
 //!   would be the exit-code bug again, in a new costume.
 //! - **The tool cannot run at all.** `Untrustworthy`, never a pass.
 
+use std::path::Path;
 use std::time::Duration;
 
 use rulebound_contract::{GateId, Primitive, Severity};
@@ -21,6 +22,7 @@ use rulebound_orchestrate::{
     Finding, GateRunBuilder, Origin, Side, Subject, SubjectKind, ToolId, UntrustworthyReason,
 };
 
+use crate::EnvironmentPolicy;
 use crate::{Completed, Interpretation, run, template_args};
 
 /// Run a declared tool and absorb its SARIF findings.
@@ -53,6 +55,116 @@ pub fn run_tool(
     timeout: Duration,
     origin: Origin,
 ) -> rulebound_orchestrate::GateRun {
+    run_tool_at(
+        gate_id, program, args, format, values, timeout, origin, None, None, None,
+    )
+}
+
+/// Run a declared external tool in a supplied candidate root.
+///
+/// # Errors
+///
+/// Tool execution and output interpretation failures are retained as
+/// untrustworthy gate outcomes.
+#[allow(clippy::too_many_arguments)]
+pub fn run_tool_in(
+    gate_id: &GateId,
+    program: &str,
+    args: &[String],
+    format: OutputFormat,
+    values: &TemplateValues,
+    timeout: Duration,
+    origin: Origin,
+    working_directory: &Path,
+) -> rulebound_orchestrate::GateRun {
+    run_tool_at(
+        gate_id,
+        program,
+        args,
+        format,
+        values,
+        timeout,
+        origin,
+        Some(working_directory),
+        None,
+        None,
+    )
+}
+
+/// Run an external tool in a supplied root with an explicit environment
+/// policy.
+///
+/// # Errors
+///
+/// Execution and output interpretation failures are retained as untrustworthy
+/// gate outcomes.
+#[allow(clippy::too_many_arguments)]
+pub fn run_tool_in_with_environment(
+    gate_id: &GateId,
+    program: &str,
+    args: &[String],
+    format: OutputFormat,
+    values: &TemplateValues,
+    timeout: Duration,
+    origin: Origin,
+    working_directory: &Path,
+    environment: &EnvironmentPolicy,
+) -> rulebound_orchestrate::GateRun {
+    run_tool_at(
+        gate_id,
+        program,
+        args,
+        format,
+        values,
+        timeout,
+        origin,
+        Some(working_directory),
+        Some(environment),
+        None,
+    )
+}
+
+/// Run an external tool with cooperative cancellation in a supplied root.
+#[allow(clippy::too_many_arguments)]
+pub fn run_tool_in_with_environment_and_cancellation(
+    gate_id: &GateId,
+    program: &str,
+    args: &[String],
+    format: OutputFormat,
+    values: &TemplateValues,
+    timeout: Duration,
+    origin: Origin,
+    working_directory: &Path,
+    environment: &EnvironmentPolicy,
+    cancellation: &crate::CancellationToken,
+) -> rulebound_orchestrate::GateRun {
+    run_tool_at(
+        gate_id,
+        program,
+        args,
+        format,
+        values,
+        timeout,
+        origin,
+        Some(working_directory),
+        Some(environment),
+        Some(cancellation),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_tool_at(
+    gate_id: &GateId,
+    program: &str,
+    args: &[String],
+    format: OutputFormat,
+    values: &TemplateValues,
+    timeout: Duration,
+    origin: Origin,
+    working_directory: Option<&Path>,
+    environment: Option<&EnvironmentPolicy>,
+    cancellation: Option<&crate::CancellationToken>,
+) -> rulebound_orchestrate::GateRun {
     let mut builder = GateRunBuilder::new();
 
     let argv = match template_args(args, &values.base, &values.head, &values.index) {
@@ -63,18 +175,50 @@ pub fn run_tool(
         }
     };
 
-    let completed = run(program, &argv, timeout);
+    let started = std::time::Instant::now();
+    let completed = if let (Some(path), Some(policy), Some(token)) =
+        (working_directory, environment, cancellation)
+    {
+        crate::run_in_with_environment_and_cancellation(
+            program, &argv, timeout, path, policy, token,
+        )
+    } else {
+        match (working_directory, environment) {
+            (Some(path), Some(policy)) => {
+                crate::run_in_with_environment(program, &argv, timeout, path, policy)
+            }
+            (Some(path), None) => crate::run_in(program, &argv, timeout, path),
+            (None, Some(policy)) => crate::run_with_environment(program, &argv, timeout, policy),
+            (None, None) => run(program, &argv, timeout),
+        }
+    };
+    builder.command(rulebound_orchestrate::CommandEvidence {
+        program: program.to_string(),
+        args: argv,
+        working_directory: working_directory.map(|path| path.display().to_string()),
+        outcome: format!("{:?}", completed.status),
+        elapsed_millis: started.elapsed().as_millis(),
+        environment_names: environment.map_or_else(Vec::new, EnvironmentPolicy::allowed_names),
+        stdout: completed.stdout.clone(),
+        stderr: completed.stderr.clone(),
+        output_truncated: completed.stdout.contains(crate::OUTPUT_TRUNCATION_MARKER)
+            || completed.stderr.contains(crate::OUTPUT_TRUNCATION_MARKER),
+    });
     match completed
         .status
         .interpretation_with(crate::cargo_exit_codes())
     {
         Interpretation::NoTrustworthyResult => {
-            builder.untrustworthy(UntrustworthyReason::ToolCouldNotRun {
-                detail: format!(
-                    "{program}: {}",
-                    Interpretation::NoTrustworthyResult.describe(completed.status)
-                ),
-            });
+            if completed.status == crate::Outcome::Cancelled {
+                builder.untrustworthy(UntrustworthyReason::Cancelled);
+            } else {
+                builder.untrustworthy(UntrustworthyReason::ToolCouldNotRun {
+                    detail: format!(
+                        "{program}: {}",
+                        Interpretation::NoTrustworthyResult.describe(completed.status)
+                    ),
+                });
+            }
             return finish(builder, gate_id, origin);
         }
         // **Exit 0 does not mean "no findings".**
@@ -93,7 +237,9 @@ pub fn run_tool(
         Interpretation::Passed | Interpretation::Failed => {
             let (tool_id, version) = match &origin {
                 Origin::Delegated { tool, version } => (tool.clone(), version.clone()),
-                Origin::Analyzed { .. } => (ToolId::new("external"), String::new()),
+                Origin::Analyzed { .. } | Origin::Embedded { .. } => {
+                    (ToolId::new("external"), String::new())
+                }
             };
             let findings = match format.parse(&completed, &tool_id, &version) {
                 Ok(f) => f,
@@ -376,6 +522,7 @@ fn origin_label(origin: &Origin) -> String {
     match origin {
         Origin::Delegated { tool, .. } => format!("external tool `{tool}`"),
         Origin::Analyzed { primitive } => format!("gate `{primitive}`"),
+        Origin::Embedded { provider, .. } => format!("embedded provider `{provider}`"),
     }
 }
 

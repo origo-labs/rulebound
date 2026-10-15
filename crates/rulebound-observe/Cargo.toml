@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 rulebound-git = { workspace = true }
+blake3 = { workspace = true }
 
 [dev-dependencies]
 rulebound-testkit = { workspace = true }
