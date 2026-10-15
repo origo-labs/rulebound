@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::fmt;
+use std::path::Path;
 
 /// A stable digest of every declared path, mode, and content in a snapshot.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -54,7 +55,7 @@ impl SnapshotEntry {
         &self.path
     }
 
-    /// File mode supplied by the snapshot owner.
+    /// Git-compatible file mode, such as `0o100644`, `0o100755`, or `0o120000`.
     pub const fn mode(&self) -> u32 {
         self.mode
     }
@@ -72,6 +73,16 @@ pub enum SnapshotError {
     InvalidPath(String),
     /// The same path was declared more than once.
     DuplicatePath(String),
+    /// Reading or inspecting an execution-root path failed.
+    Io {
+        /// Path that could not be read.
+        path: String,
+        /// Operating-system error description.
+        message: String,
+    },
+    /// The execution root contains a filesystem entry that is not a regular
+    /// file or symlink.
+    UnsupportedEntry(String),
 }
 
 impl fmt::Display for SnapshotError {
@@ -79,6 +90,10 @@ impl fmt::Display for SnapshotError {
         match self {
             Self::InvalidPath(path) => write!(f, "invalid repository-relative path: {path:?}"),
             Self::DuplicatePath(path) => write!(f, "duplicate snapshot path: {path:?}"),
+            Self::Io { path, message } => write!(f, "could not read {path:?}: {message}"),
+            Self::UnsupportedEntry(path) => {
+                write!(f, "unsupported filesystem entry in snapshot: {path:?}")
+            }
         }
     }
 }
@@ -116,6 +131,89 @@ impl Snapshot {
         })
     }
 
+    /// Read a materialized candidate tree and compute its full snapshot.
+    ///
+    /// The root-level `.git` directory is excluded as repository metadata.
+    /// Other excluded paths must be listed explicitly; a path excludes itself
+    /// and all descendants. Directories are traversed without following
+    /// symlinks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotError`] if paths cannot be read or represented as
+    /// UTF-8 repository-relative names, or if the tree contains unsupported
+    /// filesystem entries.
+    pub fn from_directory(root: &Path, ignored_paths: &[String]) -> Result<Self, SnapshotError> {
+        for path in ignored_paths {
+            validate_path(path)?;
+        }
+        let mut entries = Vec::new();
+        let mut pending = vec![(root.to_path_buf(), String::new())];
+        while let Some((directory, parent)) = pending.pop() {
+            let read_dir = std::fs::read_dir(&directory).map_err(|error| SnapshotError::Io {
+                path: directory.display().to_string(),
+                message: error.to_string(),
+            })?;
+            let mut children = read_dir
+                .map(|entry| {
+                    entry.map_err(|error| SnapshotError::Io {
+                        path: directory.display().to_string(),
+                        message: error.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            children.sort_by_key(|entry| entry.file_name());
+            for child in children {
+                let name = child.file_name().into_string().map_err(|name| {
+                    SnapshotError::InvalidPath(name.to_string_lossy().into_owned())
+                })?;
+                let relative = if parent.is_empty() {
+                    name
+                } else {
+                    format!("{parent}/{name}")
+                };
+                if relative == ".git"
+                    || relative.starts_with(".git/")
+                    || is_ignored(&relative, ignored_paths)
+                {
+                    continue;
+                }
+                let path = child.path();
+                let metadata =
+                    std::fs::symlink_metadata(&path).map_err(|error| SnapshotError::Io {
+                        path: path.display().to_string(),
+                        message: error.to_string(),
+                    })?;
+                if metadata.file_type().is_symlink() {
+                    let target = std::fs::read_link(&path).map_err(|error| SnapshotError::Io {
+                        path: path.display().to_string(),
+                        message: error.to_string(),
+                    })?;
+                    #[cfg(unix)]
+                    let content = {
+                        use std::os::unix::ffi::OsStrExt;
+                        target.as_os_str().as_bytes().to_vec()
+                    };
+                    #[cfg(not(unix))]
+                    let content = target.to_string_lossy().as_bytes().to_vec();
+                    entries.push(SnapshotEntry::new(relative, 0o120000, content)?);
+                } else if metadata.is_dir() {
+                    pending.push((path, relative));
+                } else if metadata.is_file() {
+                    let content = std::fs::read(&path).map_err(|error| SnapshotError::Io {
+                        path: path.display().to_string(),
+                        message: error.to_string(),
+                    })?;
+                    let mode = file_mode(&metadata);
+                    entries.push(SnapshotEntry::new(relative, mode, content)?);
+                } else {
+                    return Err(SnapshotError::UnsupportedEntry(relative));
+                }
+            }
+        }
+        Self::new(entries)
+    }
+
     /// Return the identity covering every declared entry.
     pub fn identity(&self) -> &SnapshotIdentity {
         &self.identity
@@ -142,12 +240,38 @@ impl Snapshot {
     }
 }
 
+fn is_ignored(path: &str, ignored_paths: &[String]) -> bool {
+    ignored_paths.iter().any(|ignored| {
+        path == ignored
+            || path
+                .strip_prefix(ignored)
+                .is_some_and(|tail| tail.starts_with('/'))
+    })
+}
+
+#[cfg(unix)]
+fn file_mode(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    if metadata.permissions().mode() & 0o111 == 0 {
+        0o100644
+    } else {
+        0o100755
+    }
+}
+
+#[cfg(not(unix))]
+fn file_mode(_metadata: &std::fs::Metadata) -> u32 {
+    0o100644
+}
+
 fn validate_path(path: &str) -> Result<(), SnapshotError> {
+    let bytes = path.as_bytes();
     let invalid = path.is_empty()
         || path.starts_with('/')
-        || path.starts_with('\\')
+        || path.contains('\\')
+        || (bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
         || path
-            .split(['/', '\\'])
+            .split('/')
             .any(|part| part == ".." || part == "." || part.is_empty())
         || path.contains('\0');
     if invalid {
