@@ -276,7 +276,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rulebound-ast"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "blake3",
  "tree-sitter",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "rulebound-cli"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "blake3",
  "camino",
@@ -302,7 +302,7 @@ dependencies = [
 
 [[package]]
 name = "rulebound-contract"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "serde",
  "toml",
@@ -310,7 +310,7 @@ dependencies = [
 
 [[package]]
 name = "rulebound-exec"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "camino",
  "libc",
@@ -321,7 +321,7 @@ dependencies = [
 
 [[package]]
 name = "rulebound-gates"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "rulebound-ast",
  "rulebound-contract",
@@ -335,14 +335,14 @@ dependencies = [
 
 [[package]]
 name = "rulebound-git"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "camino",
 ]
 
 [[package]]
 name = "rulebound-observe"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "blake3",
  "rulebound-git",
@@ -351,7 +351,7 @@ dependencies = [
 
 [[package]]
 name = "rulebound-orchestrate"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "blake3",
  "camino",
@@ -361,7 +361,7 @@ dependencies = [
 
 [[package]]
 name = "rulebound-report"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "rulebound-contract",
  "rulebound-orchestrate",
@@ -371,7 +371,7 @@ dependencies = [
 
 [[package]]
 name = "rulebound-service"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "blake3",
  "camino",
@@ -384,7 +384,7 @@ dependencies = [
 
 [[package]]
 name = "rulebound-testkit"
-version = "0.2.0-beta.1"
+version = "0.2.0-beta.2"
 dependencies = [
  "camino",
  "rulebound-git",
