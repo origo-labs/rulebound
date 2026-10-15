@@ -9,6 +9,7 @@ members = [
     "crates/rulebound-exec",
     "crates/rulebound-orchestrate",
     "crates/rulebound-report",
+    "crates/rulebound-service",
     "crates/rulebound-cli",
     "crates/rulebound-testkit",
 ]
@@ -35,6 +36,7 @@ rulebound-gates = { path = "crates/rulebound-gates" }
 rulebound-exec = { path = "crates/rulebound-exec" }
 rulebound-orchestrate = { path = "crates/rulebound-orchestrate" }
 rulebound-report = { path = "crates/rulebound-report" }
+rulebound-service = { path = "crates/rulebound-service" }
 rulebound-testkit = { path = "crates/rulebound-testkit" }
 
 tree-sitter = "0.27"

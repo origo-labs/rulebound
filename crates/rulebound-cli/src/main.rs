@@ -21,14 +21,12 @@ use std::process::ExitCode;
 use camino::Utf8PathBuf;
 use clap::{Parser, Subcommand};
 
-use std::time::Duration;
-
-use rulebound_contract::{Contract, Gate, GateId, Primitive, Severity};
-use rulebound_gates::{GateContext, GateResult, registry};
+use rulebound_contract::Contract;
 use rulebound_git::Repo;
 use rulebound_observe::{Budget, Observation};
-use rulebound_orchestrate::{GateRun, ReductionInput, Verdict, reduce};
+use rulebound_orchestrate::Verdict;
 use rulebound_report::Report;
+use rulebound_service::{EvaluationOptions, evaluate};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -178,71 +176,22 @@ fn run(cli: Cli) -> Result<Verdict, String> {
 
     let obs = capture(&repo, &base, budget, true)?;
     let (cargo_version, tool_version) = tool_versions();
-    // The head being reviewed. `base` is the first parent; the head is the
-    // merge itself, which is the pair `slop-gate` and any other two-tree tool
-    // needs.
-    let head_ref = "HEAD";
-    // Delegated gates run first, because a gate that `consumes` from one needs
-    // what it provides. The contract declares the edge; this is where it is
-    // honoured. A gate with no such edge simply sees no inventory, and makes
-    // no claim about whether a test runs.
-    let mut inventory: Option<rulebound_exec::test_inventory::TestInventory> = None;
-    let mut runs: Vec<GateRun> = Vec::new();
-    for g in &contract.gates {
-        if g.primitive == Primitive::ChecksGreen
-            && contract
-                .gates
-                .iter()
-                .any(|c| c.consumes.iter().any(|x| x == &g.id.to_string()))
-        {
-            let (run, inv) = rulebound_exec::checks_green::run_checks(
-                rulebound_exec::origin("cargo", &cargo_version),
-                timeout(g),
-            );
-            runs.push(run);
-            inventory = Some(inv);
-        }
-    }
-    for g in &contract.gates {
-        if g.primitive == Primitive::ChecksGreen && inventory.is_some() {
-            continue; // already run above, with the inventory it provides
-        }
-        runs.push(run_gate(
-            g,
-            &obs,
-            &base,
-            head_ref,
-            &cargo_version,
-            &tool_version,
-            inventory.as_ref(),
-        ));
-    }
-    // The gates that audit the contract are not in the contract. A gate that
-    // could be declared could also be deleted, and a gate that a worker can
-    // switch off is not a gate — so these are appended here, unconditionally,
-    // and `parse` refuses to accept a contract that tries to declare them.
-    runs.extend(built_in_gates(&obs, &cargo_version));
-
-    // Declaration order, so the report matches the contract even though
-    // execution had to run the providing gates first.
-    let mut ordered: Vec<GateRun> = Vec::with_capacity(runs.len());
-    for g in &contract.gates {
-        if let Some(pos) = runs.iter().position(|r| r.gate_id == g.id) {
-            ordered.push(runs.remove(pos));
-        }
-    }
-    let runs = ordered;
-    let outcomes: Vec<rulebound_orchestrate::GateOutcome> =
-        runs.iter().map(|r| r.outcome.clone()).collect();
-    let verdict = reduce(&ReductionInput {
-        outcomes: &outcomes,
-        ..Default::default()
-    });
+    let evaluation = evaluate(
+        &contract,
+        &obs,
+        &EvaluationOptions {
+            baseline: base,
+            candidate: "HEAD".to_string(),
+            now_unix: unix_now(),
+            cargo_version,
+            external_tool_version: tool_version,
+        },
+    );
 
     let report = Report {
         contract: &contract,
-        runs: &runs,
-        verdict,
+        runs: &evaluation.runs,
+        verdict: evaluation.verdict,
         tool_version: env!("CARGO_PKG_VERSION"),
     };
     // The report goes to stdout so it can be piped; anything a human needs
@@ -255,7 +204,7 @@ fn run(cli: Cli) -> Result<Verdict, String> {
             Format::Sarif => report.sarif(),
         }
     );
-    Ok(verdict)
+    Ok(evaluation.verdict)
 }
 
 /// Write a starting contract.
@@ -411,139 +360,6 @@ fn load_contract(root: &Utf8PathBuf) -> Result<Contract, String> {
     rulebound_contract::parse::parse_contract(&source).map_err(|e| format!("{path}: {e}"))
 }
 
-/// The gates the supervisor runs whether or not anybody asked for them.
-///
-/// Their severity is fixed in code and not configurable. That is a deliberate
-/// asymmetry: every other gate can be softened, because a project that
-/// disagrees can record why. These cannot be softened at all, because the
-/// thing they detect is a project softening its own gates.
-///
-/// Within them, a *justified* loosening is still reported, at `warn`. So the
-/// force is not "you may never change the contract" — it is "you may never
-/// change it silently".
-fn built_in_gates(obs: &Observation, cargo_version: &str) -> Vec<GateRun> {
-    [
-        Primitive::ContractNotLoosened,
-        Primitive::ContractReviewStale,
-    ]
-    .into_iter()
-    .map(|p| {
-        let mut g = Gate::new(
-            GateId::new(p.as_str()).expect("primitive name is a valid id"),
-            p,
-        );
-        g.severity = Severity::Error;
-        // The gate already decides per finding whether a recorded
-        // `[[changes]]` reason downgrades it, so there is no global
-        // downgrade here. An earlier version applied one if *any* finding
-        // was justified, which meant one recorded reason silently unblocked
-        // every other loosening in the same diff.
-        run_gate(&g, obs, "HEAD", "HEAD", cargo_version, "unused", None)
-    })
-    .collect()
-}
-
-/// Run one declared gate and collect everything it produced.
-///
-/// An `Analyzed` gate is a pure function of the observation and cannot fail to
-/// run. A `Delegated` gate is the only kind that can fail to run, and it is
-/// the only kind that spawns anything.
-#[allow(clippy::too_many_arguments)]
-fn run_gate(
-    gate: &Gate,
-    obs: &Observation,
-    base: &str,
-    head_ref: &str,
-    cargo_version: &str,
-    tool_version: &str,
-    inventory: Option<&rulebound_exec::test_inventory::TestInventory>,
-) -> GateRun {
-    if gate.severity == Severity::Off {
-        // Reported as `off`, never as a pass: a reader must be able to see what
-        // was not checked.
-        return GateRun::skipped(gate.id.clone(), gate.primitive);
-    }
-
-    match gate.primitive {
-        Primitive::ChecksGreen => {
-            let origin = rulebound_exec::origin("cargo", cargo_version);
-            rulebound_exec::checks_green::run_checks(origin, timeout(gate)).0
-        }
-
-        Primitive::ExternalTool => {
-            // The program and its argv come from the contract, not from here.
-            // A hard-coded tool would be a gate that checks one specific
-            // third-party linter whether the project asked for it or not, and
-            // the project is the only thing that knows which linter it wants
-            // and where its baseline artefact lives.
-            // `parse` refuses an `external_tool` with no `tool`, so this is
-            // reachable only if a Gate were built by hand.
-            let Some(tool) = gate.tool.as_deref() else {
-                return GateRun::untrustworthy(
-                    gate.id.clone(),
-                    gate.primitive,
-                    rulebound_orchestrate::UntrustworthyReason::ContractInvalid {
-                        detail: "an `external_tool` gate declares no `tool`".to_string(),
-                    },
-                    rulebound_orchestrate::Origin::Delegated {
-                        tool: rulebound_orchestrate::ToolId::new("external"),
-                        version: String::new(),
-                    },
-                );
-            };
-            let origin = rulebound_exec::origin(tool, tool_version);
-            let format = match gate.format.as_deref() {
-                Some("lines") => rulebound_exec::external_tool::OutputFormat::Lines,
-                _ => rulebound_exec::external_tool::OutputFormat::Sarif,
-            };
-            // The index path is project state, not ours: it lives wherever the
-            // project's CI puts it.
-            let values = rulebound_exec::external_tool::TemplateValues {
-                base: base.to_string(),
-                head: head_ref.to_string(),
-                index: gate
-                    .args
-                    .iter()
-                    .find_map(|a| a.strip_prefix("--index=").map(str::to_string))
-                    .unwrap_or_default(),
-            };
-            rulebound_exec::external_tool::run_tool(
-                &gate.id,
-                tool,
-                &gate.args,
-                format,
-                &values,
-                timeout(gate),
-                origin,
-            )
-        }
-        other => {
-            let result = registry::dispatch(
-                other,
-                &GateContext {
-                    gate,
-                    observation: obs,
-                    test_inventory: inventory,
-                    // The only clock read in a gate, and it is here rather
-                    // than inside `contract_review_stale` so that gate stays a
-                    // pure function of its inputs.
-                    now_unix: unix_now(),
-                },
-            );
-            let origin = rulebound_orchestrate::Origin::Analyzed { primitive: other };
-            match result {
-                GateResult::Clean => GateRun::passed(gate.id.clone(), other, origin),
-                GateResult::Findings(f) => {
-                    GateRun::with_findings(gate.id.clone(), other, f, origin)
-                }
-                GateResult::Untrustworthy(reason) => {
-                    GateRun::untrustworthy(gate.id.clone(), other, reason, origin)
-                }
-            }
-        }
-    }
-}
-
 /// Unix seconds, once per invocation.
 ///
 /// The only clock in the workspace. Every gate that needs the time is handed
@@ -552,15 +368,6 @@ fn unix_now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
-}
-
-/// A gate's timeout, defaulting generously.
-///
-/// `cargo test` on a large repository is minutes, and a supervisor that
-/// declares a test suite is opting into that cost. The default is a ceiling on
-/// a runaway, not a target.
-fn timeout(gate: &Gate) -> Duration {
-    Duration::from_secs(gate.timeout_seconds.unwrap_or(900))
 }
 
 /// The versions of the tools we delegate to, resolved once per invocation.

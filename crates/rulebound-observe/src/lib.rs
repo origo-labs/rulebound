@@ -17,6 +17,8 @@
 
 use rulebound_git::ObservationInputs;
 
+pub mod snapshot;
+
 /// Reserved inside the budget. If a budget is smaller than this, the marker
 /// itself is shortened rather than the guarantee dropped.
 pub const TRUNCATION_MARKER: &str = "\n[rulebound: observation truncated to budget]\n";
@@ -176,6 +178,12 @@ impl FileView {
 pub struct Observation {
     /// Resolved base commit, when a base was requested.
     pub base: Option<String>,
+    /// Identity of the complete baseline snapshot when constructed from
+    /// explicit snapshots.
+    pub baseline_identity: Option<snapshot::SnapshotIdentity>,
+    /// Identity of the complete candidate snapshot when constructed from
+    /// explicit snapshots.
+    pub candidate_identity: Option<snapshot::SnapshotIdentity>,
     /// The bound this observation was captured under.
     pub budget: Budget,
     /// The clipped diff, marker included within the budget.
@@ -253,6 +261,8 @@ impl Observation {
 
         Self {
             base: inputs.base.clone(),
+            baseline_identity: None,
+            candidate_identity: None,
             budget,
             diff,
             status,
@@ -269,6 +279,110 @@ impl Observation {
                 .collect(),
             empty,
         }
+    }
+
+    /// Build a two-tree observation directly from immutable snapshots.
+    ///
+    /// Changed file contents remain complete in `files`; only the rendered
+    /// diff is subject to `budget`. Non-UTF-8 changed files are rejected
+    /// because the existing analyzed gates consume text.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SnapshotObservationError`] when a changed path contains
+    /// invalid UTF-8.
+    pub fn from_snapshots(
+        baseline: &snapshot::Snapshot,
+        candidate: &snapshot::Snapshot,
+        baseline_commit: Option<String>,
+        budget: Budget,
+        expect_diff: bool,
+    ) -> Result<Self, SnapshotObservationError> {
+        let paths: std::collections::BTreeSet<_> = baseline
+            .entries()
+            .map(|entry| entry.path().to_string())
+            .chain(candidate.entries().map(|entry| entry.path().to_string()))
+            .collect();
+        let mut files = Vec::new();
+        let mut status = Vec::new();
+        let mut rendered_diff = String::new();
+
+        for path in paths {
+            let before = baseline.entry(&path);
+            let after = candidate.entry(&path);
+            let content_changed =
+                before.map(|e| (e.mode(), e.content())) != after.map(|e| (e.mode(), e.content()));
+            if !content_changed {
+                continue;
+            }
+            let base_text = before
+                .map(|entry| {
+                    std::str::from_utf8(entry.content())
+                        .map(str::to_string)
+                        .map_err(|_| SnapshotObservationError::InvalidUtf8 {
+                            path: path.clone(),
+                            side: SnapshotSide::Baseline,
+                        })
+                })
+                .transpose()?;
+            let head_text = after
+                .map(|entry| {
+                    std::str::from_utf8(entry.content())
+                        .map(str::to_string)
+                        .map_err(|_| SnapshotObservationError::InvalidUtf8 {
+                            path: path.clone(),
+                            side: SnapshotSide::Candidate,
+                        })
+                })
+                .transpose()?;
+            files.push(FileView {
+                path: path.clone(),
+                orig_path: None,
+                base: base_text.clone(),
+                head: head_text.clone(),
+                truncated: false,
+            });
+            let (x, y) = match (before, after) {
+                (None, Some(_)) => ('?', '?'),
+                (Some(_), None) => ('D', ' '),
+                (Some(_), Some(_)) => (' ', 'M'),
+                (None, None) => continue,
+            };
+            status.push(StatusLine {
+                x,
+                y,
+                path: path.clone(),
+                orig_path: None,
+            });
+            append_file_diff(
+                &mut rendered_diff,
+                &path,
+                base_text.as_deref(),
+                head_text.as_deref(),
+            );
+        }
+
+        let diff = budget.clip(&rendered_diff);
+        let empty = if files.is_empty() {
+            Some(if expect_diff {
+                EmptyReason::DiffExpectedButAbsent
+            } else {
+                EmptyReason::NoChangesAgainstBase
+            })
+        } else {
+            None
+        };
+
+        Ok(Self {
+            base: baseline_commit,
+            baseline_identity: Some(baseline.identity().clone()),
+            candidate_identity: Some(candidate.identity().clone()),
+            budget,
+            diff,
+            status,
+            files,
+            empty,
+        })
     }
 
     /// Whether there is nothing to review. Check
@@ -295,6 +409,60 @@ impl Observation {
         mut pred: impl FnMut(&'a FileView) -> bool,
     ) -> impl Iterator<Item = &'a FileView> {
         self.files.iter().filter(move |f| pred(f))
+    }
+}
+
+/// Which snapshot side contained non-UTF-8 bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SnapshotSide {
+    /// The baseline snapshot.
+    Baseline,
+    /// The candidate snapshot.
+    Candidate,
+}
+
+/// Failure to adapt full snapshot bytes into the current text-based gates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotObservationError {
+    /// A changed file is not valid UTF-8.
+    InvalidUtf8 {
+        /// Repository-relative path.
+        path: String,
+        /// Snapshot side containing invalid bytes.
+        side: SnapshotSide,
+    },
+}
+
+impl std::fmt::Display for SnapshotObservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidUtf8 { path, side } => {
+                write!(f, "{side:?} snapshot file {path:?} is not valid UTF-8")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SnapshotObservationError {}
+
+fn append_file_diff(out: &mut String, path: &str, before: Option<&str>, after: Option<&str>) {
+    let old_lines = before.map_or(0, |text| text.lines().count());
+    let new_lines = after.map_or(0, |text| text.lines().count());
+    out.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
+    out.push_str(&format!("@@ -1,{old_lines} +1,{new_lines} @@\n"));
+    if let Some(text) = before {
+        for line in text.lines() {
+            out.push('-');
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if let Some(text) = after {
+        for line in text.lines() {
+            out.push('+');
+            out.push_str(line);
+            out.push('\n');
+        }
     }
 }
 

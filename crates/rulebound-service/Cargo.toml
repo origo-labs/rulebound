@@ -1,0 +1,18 @@
+[package]
+name = "rulebound-service"
+description = "Shared evaluation orchestration for embedded callers and the CLI."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+rulebound-contract = { workspace = true }
+rulebound-observe = { workspace = true }
+rulebound-gates = { workspace = true }
+rulebound-exec = { workspace = true }
+rulebound-orchestrate = { workspace = true }
