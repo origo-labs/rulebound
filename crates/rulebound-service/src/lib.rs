@@ -880,9 +880,11 @@ fn run_embedded(
             .coverage
             .required_paths
             .is_subset(&result.coverage.inspected_paths)
-        || result.coverage.required_paths.iter().any(|path| {
-            baseline.entry(path).is_none() && candidate.entry(path).is_none()
-        })
+        || result
+            .coverage
+            .required_paths
+            .iter()
+            .any(|path| baseline.entry(path).is_none() && candidate.entry(path).is_none())
     {
         builder.untrustworthy(UntrustworthyReason::ProviderCoverageIncomplete {
             provider: provider_id.to_string(),
@@ -899,12 +901,11 @@ fn run_embedded(
             detail: "provider returned incomplete provenance".to_string(),
         });
     }
-    for finding in result
-        .findings
-        .into_iter()
-        .take(options.resource_limits.max_findings)
-    {
-        if finding.line.is_some_and(|line| line == 0 || line == u32::MAX) {
+    for finding in result.findings {
+        if finding
+            .line
+            .is_some_and(|line| line == 0 || line == u32::MAX)
+        {
             builder.untrustworthy(UntrustworthyReason::Indeterminate {
                 detail: "provider returned an invalid source line".to_string(),
             });
