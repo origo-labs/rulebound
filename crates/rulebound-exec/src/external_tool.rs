@@ -175,6 +175,7 @@ fn run_tool_at(
         }
     };
 
+    let started = std::time::Instant::now();
     let completed = if let (Some(path), Some(policy), Some(token)) =
         (working_directory, environment, cancellation)
     {
@@ -191,6 +192,17 @@ fn run_tool_at(
             (None, None) => run(program, &argv, timeout),
         }
     };
+    builder.command(rulebound_orchestrate::CommandEvidence {
+        program: program.to_string(),
+        args: argv,
+        working_directory: working_directory.map(|path| path.display().to_string()),
+        outcome: format!("{:?}", completed.status),
+        elapsed_millis: started.elapsed().as_millis(),
+        environment_names: environment.map_or_else(Vec::new, EnvironmentPolicy::allowed_names),
+        stdout: completed.stdout.clone(),
+        stderr: completed.stderr.clone(),
+        output_truncated: false,
+    });
     match completed
         .status
         .interpretation_with(crate::cargo_exit_codes())

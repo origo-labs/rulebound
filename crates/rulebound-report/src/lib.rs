@@ -146,6 +146,12 @@ impl Report<'_> {
                     coverage.required_paths.len(),
                 ));
             }
+            for command in &run.commands {
+                out.push_str(&format!(
+                    "           command: {} {:?} ({}, {} ms)\n",
+                    command.program, command.args, command.outcome, command.elapsed_millis,
+                ));
+            }
         }
         out.push('\n');
         out.push_str(&format!("verdict: {}\n", self.verdict));
@@ -224,6 +230,7 @@ impl Report<'_> {
                 outcome: outcome_name(&r.outcome),
                 origin: r.outcome.origin().map(origin_json),
                 finding_count: r.findings.len(),
+                commands: r.commands.iter().map(command_json).collect(),
                 detail: outcome_detail(&r.outcome),
                 coverage: r.coverage.as_ref().map(|coverage| {
                     serde_json::json!({
@@ -368,6 +375,7 @@ impl Report<'_> {
                         "detail": outcome_detail(&run.outcome),
                         "origin": run.outcome.origin().map(origin_json),
                         "findingCount": run.findings.len(),
+                        "commands": run.commands.iter().map(command_json).collect::<Vec<_>>(),
                     })).collect::<Vec<_>>(),
                 "gateCoverage": self.runs.iter().filter_map(|run| {
                     run.coverage.as_ref().map(|coverage| (
@@ -616,10 +624,25 @@ struct GateJson {
     origin: Option<serde_json::Value>,
     #[serde(rename = "findingCount")]
     finding_count: usize,
+    commands: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     coverage: Option<serde_json::Value>,
+}
+
+fn command_json(command: &rulebound_orchestrate::CommandEvidence) -> serde_json::Value {
+    serde_json::json!({
+        "program": command.program,
+        "args": command.args,
+        "workingDirectory": command.working_directory,
+        "outcome": command.outcome,
+        "elapsedMilliseconds": command.elapsed_millis,
+        "environmentNames": command.environment_names,
+        "stdout": command.stdout,
+        "stderr": command.stderr,
+        "outputTruncated": command.output_truncated,
+    })
 }
 
 fn outcome_detail(outcome: &GateOutcome) -> Option<serde_json::Value> {

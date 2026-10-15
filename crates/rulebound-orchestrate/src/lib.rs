@@ -823,8 +823,33 @@ pub struct GateRun {
     pub findings: Vec<Finding>,
     /// Declared input coverage, when the check reports it.
     pub coverage: Option<GateCoverage>,
+    /// Child process evidence collected by delegated checks.
+    pub commands: Vec<CommandEvidence>,
     /// The single outcome the verdict algebra sees.
     pub outcome: GateOutcome,
+}
+
+/// Captured evidence for one delegated child process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandEvidence {
+    /// Executable name or path supplied to the process launcher.
+    pub program: String,
+    /// Arguments passed without shell interpolation.
+    pub args: Vec<String>,
+    /// Working directory, when explicitly set.
+    pub working_directory: Option<String>,
+    /// Process outcome before the gate interpreted its output.
+    pub outcome: String,
+    /// Wall time from launch through process completion, in milliseconds.
+    pub elapsed_millis: u128,
+    /// Allowed environment variable names. Values are never recorded.
+    pub environment_names: Vec<String>,
+    /// Captured standard output returned by the process.
+    pub stdout: String,
+    /// Captured standard error returned by the process.
+    pub stderr: String,
+    /// Whether captured output was truncated by the process adapter.
+    pub output_truncated: bool,
 }
 
 /// Coverage evidence supplied by an analyzed gate or embedded provider.
@@ -846,6 +871,7 @@ impl GateRun {
             primitive,
             findings: Vec::new(),
             coverage: None,
+            commands: Vec::new(),
             outcome: GateOutcome::Pass { origin },
         }
     }
@@ -858,6 +884,7 @@ impl GateRun {
             primitive,
             findings: Vec::new(),
             coverage: None,
+            commands: Vec::new(),
             outcome: GateOutcome::Skipped {
                 reason: SkipReason::DeclaredOff,
             },
@@ -876,6 +903,7 @@ impl GateRun {
             primitive,
             findings: Vec::new(),
             coverage: None,
+            commands: Vec::new(),
             outcome: GateOutcome::Untrustworthy { reason, origin },
         }
     }
@@ -897,6 +925,7 @@ impl GateRun {
             primitive,
             findings,
             coverage: None,
+            commands: Vec::new(),
             outcome,
         }
     }
@@ -928,6 +957,7 @@ pub struct GateRunBuilder {
     findings: Vec<Finding>,
     untrustworthy: Option<UntrustworthyReason>,
     coverage: Option<GateCoverage>,
+    commands: Vec<CommandEvidence>,
 }
 
 impl GateRunBuilder {
@@ -954,6 +984,11 @@ impl GateRunBuilder {
         self.coverage = Some(coverage);
     }
 
+    /// Attach captured process evidence to the resulting run.
+    pub fn command(&mut self, command: CommandEvidence) {
+        self.commands.push(command);
+    }
+
     /// Whether any finding has been recorded.
     pub fn has_findings(&self) -> bool {
         !self.findings.is_empty()
@@ -967,11 +1002,13 @@ impl GateRunBuilder {
                 primitive,
                 findings: self.findings,
                 coverage: self.coverage,
+                commands: self.commands,
                 outcome: GateOutcome::Untrustworthy { reason, origin },
             };
         }
         let mut run = GateRun::with_findings(gate_id, primitive, self.findings, origin);
         run.coverage = self.coverage;
+        run.commands = self.commands;
         run
     }
 }

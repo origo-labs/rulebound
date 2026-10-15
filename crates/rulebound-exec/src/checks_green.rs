@@ -145,28 +145,35 @@ fn run_checks_at(
 ) {
     let mut builder = GateRunBuilder::new();
     for check in Check::ALL {
-        apply(
-            &mut builder,
-            check,
-            run_cargo(
-                &check.argv(),
-                timeout,
-                working_directory,
-                environment,
-                cancellation,
-            ),
-            &origin,
-        );
+        let args = check.argv();
+        let started = std::time::Instant::now();
+        let completed = run_cargo(&args, timeout, working_directory, environment, cancellation);
+        builder.command(rulebound_orchestrate::CommandEvidence {
+            program: "cargo".to_string(),
+            args,
+            working_directory: working_directory.map(|path| path.display().to_string()),
+            outcome: format!("{:?}", completed.status),
+            elapsed_millis: started.elapsed().as_millis(),
+            environment_names: environment.map_or_else(Vec::new, EnvironmentPolicy::allowed_names),
+            stdout: completed.stdout.clone(),
+            stderr: completed.stderr.clone(),
+            output_truncated: false,
+        });
+        apply(&mut builder, check, completed, &origin);
     }
+    let inventory = list_tests(
+        timeout,
+        working_directory,
+        environment,
+        cancellation,
+        &mut builder,
+    );
     let run = builder.finish(
         rulebound_contract::GateId::new("checks_green").expect("constant is valid"),
         rulebound_contract::Primitive::ChecksGreen,
         origin,
     );
-    (
-        run,
-        list_tests(timeout, working_directory, environment, cancellation),
-    )
+    (run, inventory)
 }
 
 /// The test inventory: `cargo test -- --list`.
@@ -181,14 +188,22 @@ fn list_tests(
     working_directory: Option<&Path>,
     environment: Option<&EnvironmentPolicy>,
     cancellation: Option<&crate::CancellationToken>,
+    builder: &mut GateRunBuilder,
 ) -> crate::test_inventory::TestInventory {
-    let completed = run_cargo(
-        &["test".to_string(), "--".to_string(), "--list".to_string()],
-        timeout,
-        working_directory,
-        environment,
-        cancellation,
-    );
+    let args = ["test".to_string(), "--".to_string(), "--list".to_string()];
+    let started = std::time::Instant::now();
+    let completed = run_cargo(&args, timeout, working_directory, environment, cancellation);
+    builder.command(rulebound_orchestrate::CommandEvidence {
+        program: "cargo".to_string(),
+        args: args.to_vec(),
+        working_directory: working_directory.map(|path| path.display().to_string()),
+        outcome: format!("{:?}", completed.status),
+        elapsed_millis: started.elapsed().as_millis(),
+        environment_names: environment.map_or_else(Vec::new, EnvironmentPolicy::allowed_names),
+        stdout: completed.stdout.clone(),
+        stderr: completed.stderr.clone(),
+        output_truncated: false,
+    });
     // An inventory we could not read is an empty one, and the consuming gate
     // has to be able to tell that from a build with no tests. `checks_green`
     // already reported the failure against the `test` check; the gate that
