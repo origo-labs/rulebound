@@ -4,6 +4,7 @@
 //! Snapshot capture and execution-root verification will be added at this
 //! boundary while the CLI remains an adapter over the shared evaluator.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use rulebound_contract::{Contract, Gate, GateId, Primitive, Severity};
@@ -14,6 +15,8 @@ use rulebound_orchestrate::{GateRun, ReductionInput, Verdict, reduce};
 /// Inputs that the caller supplies to make an evaluation reproducible.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EvaluationOptions {
+    /// Root directory in which all process checks run.
+    pub execution_root: PathBuf,
     /// Resolved baseline commit identifier.
     pub baseline: String,
     /// Candidate reference used to expand external-tool arguments.
@@ -68,9 +71,10 @@ pub fn evaluate(
                     .any(|id| id == &gate.id.to_string())
             })
         {
-            let (run, provided_inventory) = rulebound_exec::checks_green::run_checks(
+            let (run, provided_inventory) = rulebound_exec::checks_green::run_checks_in(
                 rulebound_exec::origin("cargo", &options.cargo_version),
                 timeout(gate),
+                &options.execution_root,
             );
             runs.push(run);
             inventory = Some(provided_inventory);
@@ -134,9 +138,10 @@ fn run_gate(
 
     match gate.primitive {
         Primitive::ChecksGreen => {
-            rulebound_exec::checks_green::run_checks(
+            rulebound_exec::checks_green::run_checks_in(
                 rulebound_exec::origin("cargo", &options.cargo_version),
                 timeout(gate),
+                &options.execution_root,
             )
             .0
         }
@@ -167,7 +172,7 @@ fn run_gate(
                     .find_map(|arg| arg.strip_prefix("--index=").map(str::to_string))
                     .unwrap_or_default(),
             };
-            rulebound_exec::external_tool::run_tool(
+            rulebound_exec::external_tool::run_tool_in(
                 &gate.id,
                 tool,
                 &gate.args,
@@ -175,6 +180,7 @@ fn run_gate(
                 &values,
                 timeout(gate),
                 rulebound_exec::origin(tool, &options.external_tool_version),
+                &options.execution_root,
             )
         }
         primitive => {

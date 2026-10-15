@@ -211,7 +211,34 @@ impl Interpretation {
 /// or dies is a *result*, because distinguishing it from a failure is the
 /// entire purpose of this crate. Only a programming error panics.
 pub fn run(program: &str, args: &[String], timeout: Duration) -> Completed {
-    let mut child = match Command::new(program)
+    run_at(program, args, timeout, None)
+}
+
+/// Run a program in an explicit working directory, capturing output with a
+/// hard timeout.
+///
+/// # Errors
+///
+/// Startup, timeout, and process failures are returned in [`Completed`],
+/// preserving the distinction between a failed check and a check that could
+/// not produce a trustworthy result.
+pub fn run_in(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    working_directory: &Path,
+) -> Completed {
+    run_at(program, args, timeout, Some(working_directory))
+}
+
+fn run_at(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    working_directory: Option<&Path>,
+) -> Completed {
+    let mut command = Command::new(program);
+    command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -226,9 +253,11 @@ pub fn run(program: &str, args: &[String], timeout: Duration) -> Completed {
         .env("TERM", "dumb")
         // An argument list is data, never a shell. `Command` does not use one,
         // and setting this makes that explicit to anything downstream.
-        .env("SHELL", "/bin/sh")
-        .spawn()
-    {
+        .env("SHELL", "/bin/sh");
+    if let Some(directory) = working_directory {
+        command.current_dir(directory);
+    }
+    let mut child = match command.spawn() {
         Ok(c) => c,
         Err(_) => {
             return Completed {

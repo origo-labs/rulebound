@@ -180,6 +180,7 @@ fn run(cli: Cli) -> Result<Verdict, String> {
         &contract,
         &obs,
         &EvaluationOptions {
+            execution_root: repo.root().as_std_path().to_path_buf(),
             baseline: base,
             candidate: "HEAD".to_string(),
             now_unix: unix_now(),

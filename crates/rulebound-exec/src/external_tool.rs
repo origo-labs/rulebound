@@ -14,6 +14,7 @@
 //!   would be the exit-code bug again, in a new costume.
 //! - **The tool cannot run at all.** `Untrustworthy`, never a pass.
 
+use std::path::Path;
 use std::time::Duration;
 
 use rulebound_contract::{GateId, Primitive, Severity};
@@ -53,6 +54,51 @@ pub fn run_tool(
     timeout: Duration,
     origin: Origin,
 ) -> rulebound_orchestrate::GateRun {
+    run_tool_at(
+        gate_id, program, args, format, values, timeout, origin, None,
+    )
+}
+
+/// Run a declared external tool in a supplied candidate root.
+///
+/// # Errors
+///
+/// Tool execution and output interpretation failures are retained as
+/// untrustworthy gate outcomes.
+#[allow(clippy::too_many_arguments)]
+pub fn run_tool_in(
+    gate_id: &GateId,
+    program: &str,
+    args: &[String],
+    format: OutputFormat,
+    values: &TemplateValues,
+    timeout: Duration,
+    origin: Origin,
+    working_directory: &Path,
+) -> rulebound_orchestrate::GateRun {
+    run_tool_at(
+        gate_id,
+        program,
+        args,
+        format,
+        values,
+        timeout,
+        origin,
+        Some(working_directory),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_tool_at(
+    gate_id: &GateId,
+    program: &str,
+    args: &[String],
+    format: OutputFormat,
+    values: &TemplateValues,
+    timeout: Duration,
+    origin: Origin,
+    working_directory: Option<&Path>,
+) -> rulebound_orchestrate::GateRun {
     let mut builder = GateRunBuilder::new();
 
     let argv = match template_args(args, &values.base, &values.head, &values.index) {
@@ -63,7 +109,10 @@ pub fn run_tool(
         }
     };
 
-    let completed = run(program, &argv, timeout);
+    let completed = match working_directory {
+        Some(path) => crate::run_in(program, &argv, timeout, path),
+        None => run(program, &argv, timeout),
+    };
     match completed
         .status
         .interpretation_with(crate::cargo_exit_codes())

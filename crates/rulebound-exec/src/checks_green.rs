@@ -13,6 +13,7 @@
 //! one. Collapsing these to a single result throws away exactly the evidence
 //! PRD 7 requires a block to carry.
 
+use std::path::Path;
 use std::time::Duration;
 
 use rulebound_orchestrate::{Finding, GateRunBuilder, Origin, Side, Subject, SubjectKind};
@@ -68,12 +69,39 @@ pub fn run_checks(
     rulebound_orchestrate::GateRun,
     crate::test_inventory::TestInventory,
 ) {
+    run_checks_at(origin, timeout, None)
+}
+
+/// Run the built-in Cargo checks in a supplied project root.
+///
+/// # Errors
+///
+/// Process startup and check failures remain typed in the returned gate run.
+pub fn run_checks_in(
+    origin: Origin,
+    timeout: Duration,
+    working_directory: &Path,
+) -> (
+    rulebound_orchestrate::GateRun,
+    crate::test_inventory::TestInventory,
+) {
+    run_checks_at(origin, timeout, Some(working_directory))
+}
+
+fn run_checks_at(
+    origin: Origin,
+    timeout: Duration,
+    working_directory: Option<&Path>,
+) -> (
+    rulebound_orchestrate::GateRun,
+    crate::test_inventory::TestInventory,
+) {
     let mut builder = GateRunBuilder::new();
     for check in Check::ALL {
         apply(
             &mut builder,
             check,
-            run("cargo", &check.argv(), timeout),
+            run_cargo(&check.argv(), timeout, working_directory),
             &origin,
         );
     }
@@ -82,7 +110,7 @@ pub fn run_checks(
         rulebound_contract::Primitive::ChecksGreen,
         origin,
     );
-    (run, list_tests(timeout))
+    (run, list_tests(timeout, working_directory))
 }
 
 /// The test inventory: `cargo test -- --list`.
@@ -92,11 +120,14 @@ pub fn run_checks(
 /// `--list` output already contains. A supervisor that runs a test suite it was
 /// not asked to run is a different product with a different failure mode — and
 /// `checks_green` runs the suite anyway, as its own job.
-fn list_tests(timeout: Duration) -> crate::test_inventory::TestInventory {
-    let completed = run(
-        "cargo",
+fn list_tests(
+    timeout: Duration,
+    working_directory: Option<&Path>,
+) -> crate::test_inventory::TestInventory {
+    let completed = run_cargo(
         &["test".to_string(), "--".to_string(), "--list".to_string()],
         timeout,
+        working_directory,
     );
     // An inventory we could not read is an empty one, and the consuming gate
     // has to be able to tell that from a build with no tests. `checks_green`
@@ -110,6 +141,13 @@ fn list_tests(timeout: Duration) -> crate::test_inventory::TestInventory {
         return crate::test_inventory::TestInventory::empty();
     }
     crate::test_inventory::TestInventory::parse(&completed.stdout).0
+}
+
+fn run_cargo(args: &[String], timeout: Duration, working_directory: Option<&Path>) -> Completed {
+    match working_directory {
+        Some(path) => crate::run_in("cargo", args, timeout, path),
+        None => crate::run("cargo", args, timeout),
+    }
 }
 
 /// Fold one command's result into the run.
