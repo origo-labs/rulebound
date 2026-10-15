@@ -483,6 +483,11 @@ fn run_at_with_environment_and_cancellation(
     if let Some(directory) = working_directory {
         command.current_dir(directory);
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
     let mut child = match command.spawn() {
         Ok(c) => c,
         Err(_) => {
@@ -506,12 +511,13 @@ fn run_at_with_environment_and_cancellation(
     let deadline = Instant::now() + timeout;
     let outcome = loop {
         if cancellation.is_some_and(CancellationToken::is_cancelled) {
-            let _ = child.kill();
+            terminate_child_process_tree(&mut child);
             let _ = child.wait();
             break Outcome::Cancelled;
         }
         match child.try_wait() {
             Ok(Some(s)) => {
+                terminate_child_process_tree(&mut child);
                 let outcome = if s.success() {
                     Outcome::Exited(0)
                 } else {
@@ -529,10 +535,13 @@ fn run_at_with_environment_and_cancellation(
                 break outcome;
             }
             Ok(None) => {}
-            Err(_) => break Outcome::SpawnFailed,
+            Err(_) => {
+                terminate_child_process_tree(&mut child);
+                break Outcome::SpawnFailed;
+            }
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
+            terminate_child_process_tree(&mut child);
             let _ = child.wait();
             break Outcome::TimedOut;
         }
@@ -546,6 +555,26 @@ fn run_at_with_environment_and_cancellation(
         status: outcome,
         stdout,
         stderr,
+    }
+}
+
+fn terminate_child_process_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(process_group) = libc::pid_t::try_from(child.id()) {
+            // SAFETY: `process_group(0)` created a group led by this child.
+            // A negative PID targets only that isolated group.
+            let result = unsafe { libc::kill(-process_group, libc::SIGKILL) };
+            if result != 0 {
+                let _ = child.kill();
+            }
+        } else {
+            let _ = child.kill();
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = child.kill();
     }
 }
 
@@ -733,6 +762,16 @@ mod tests {
             captured.len(),
             MAX_CAPTURED_OUTPUT_BYTES + OUTPUT_TRUNCATION_MARKER.len()
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn completed_command_cleans_up_pipe_holding_descendants() {
+        let started = Instant::now();
+        let completed = sh("sleep 30 & exit 0");
+
+        assert_eq!(completed.status, Outcome::Exited(0));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

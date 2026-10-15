@@ -36,7 +36,7 @@ For an enabled gate, coverage is incomplete when the provider marks the result i
 
 The time limit is checked after provider analysis returns. Providers must honor cancellation cooperatively; Rulebound does not terminate provider threads. Process checks also receive the cancellation token and terminate their direct child process. A provider should not leave background workers running after `analyze` returns.
 
-Rulebound retains at most 2 MiB from each child output stream and continues draining excess output. It appends a truncation marker and sets `outputTruncated` in command evidence. The current process adapter terminates the direct child on timeout or cancellation; detached descendants are outside its cleanup boundary.
+Rulebound retains at most 2 MiB from each child output stream and continues draining excess output. It appends a truncation marker and sets `outputTruncated` in command evidence. On Unix, Rulebound starts each process in its own process group and terminates that group on timeout, cancellation, or parent exit. Other platforms terminate the direct child. A process that deliberately detaches into another group is outside this cleanup boundary.
 
 ## Run the consumer example
 

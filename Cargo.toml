@@ -48,6 +48,7 @@ camino = "1"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 rayon = "1"
+libc = "0.2"
 
 [workspace.lints.rust]
 missing_debug_implementations = "warn"
