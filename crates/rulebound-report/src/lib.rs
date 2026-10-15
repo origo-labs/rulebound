@@ -412,12 +412,16 @@ fn context_json(context: &ReportContext, runs: &[GateRun], version: &str) -> ser
             provider,
             version,
             analyzer_fingerprint,
+            analyzer_identity,
+            effective_policy_fingerprint,
         }) = run.outcome.origin()
         {
             let identity = serde_json::json!({
                 "provider": provider,
                 "version": version,
                 "analyzerFingerprint": analyzer_fingerprint,
+                "analyzerIdentity": analyzer_identity,
+                "effectivePolicyFingerprint": effective_policy_fingerprint,
             });
             if !providers.contains(&identity) {
                 providers.push(identity);
@@ -463,11 +467,15 @@ fn origin_json(origin: &Origin) -> serde_json::Value {
             provider,
             version,
             analyzer_fingerprint,
+            analyzer_identity,
+            effective_policy_fingerprint,
         } => serde_json::json!({
             "kind": "embedded",
             "provider": provider,
             "version": version,
             "analyzerFingerprint": analyzer_fingerprint,
+            "analyzerIdentity": analyzer_identity,
+            "effectivePolicyFingerprint": effective_policy_fingerprint,
         }),
     }
 }

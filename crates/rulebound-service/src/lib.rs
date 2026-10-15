@@ -771,6 +771,8 @@ fn run_embedded(
         provider: provider_id.to_string(),
         version: String::new(),
         analyzer_fingerprint: String::new(),
+        analyzer_identity: String::new(),
+        effective_policy_fingerprint: String::new(),
     };
     let untrustworthy =
         |reason| GateRun::untrustworthy(gate.id.clone(), gate.primitive, reason, fallback_origin());
@@ -845,6 +847,8 @@ fn run_embedded(
         provider: provider_id.to_string(),
         version: result.implementation_version.clone(),
         analyzer_fingerprint: result.analyzer_fingerprint.clone(),
+        analyzer_identity: result.analyzer_identity.clone(),
+        effective_policy_fingerprint: result.effective_policy_fingerprint.clone(),
     };
     let mut builder = GateRunBuilder::new();
     let required_covered = result

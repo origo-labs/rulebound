@@ -46,6 +46,10 @@ pub enum Origin {
         version: String,
         /// Fingerprint identifying the analyzer implementation.
         analyzer_fingerprint: String,
+        /// Analyzer engine or model identity.
+        analyzer_identity: String,
+        /// Fingerprint of the effective provider policy.
+        effective_policy_fingerprint: String,
     },
 }
 
