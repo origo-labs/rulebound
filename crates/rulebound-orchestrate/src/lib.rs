@@ -803,8 +803,21 @@ pub struct GateRun {
     pub primitive: Primitive,
     /// Every finding, uncollapsed and in the order the gate produced them.
     pub findings: Vec<Finding>,
+    /// Declared input coverage, when the check reports it.
+    pub coverage: Option<GateCoverage>,
     /// The single outcome the verdict algebra sees.
     pub outcome: GateOutcome,
+}
+
+/// Coverage evidence supplied by an analyzed gate or embedded provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GateCoverage {
+    /// Paths the check inspected.
+    pub inspected_paths: Vec<String>,
+    /// Paths required for a complete result.
+    pub required_paths: Vec<String>,
+    /// Whether analysis completed across the declared required paths.
+    pub complete: bool,
 }
 
 impl GateRun {
@@ -814,6 +827,7 @@ impl GateRun {
             gate_id,
             primitive,
             findings: Vec::new(),
+            coverage: None,
             outcome: GateOutcome::Pass { origin },
         }
     }
@@ -825,6 +839,7 @@ impl GateRun {
             gate_id,
             primitive,
             findings: Vec::new(),
+            coverage: None,
             outcome: GateOutcome::Skipped {
                 reason: SkipReason::DeclaredOff,
             },
@@ -842,6 +857,7 @@ impl GateRun {
             gate_id,
             primitive,
             findings: Vec::new(),
+            coverage: None,
             outcome: GateOutcome::Untrustworthy { reason, origin },
         }
     }
@@ -862,6 +878,7 @@ impl GateRun {
             gate_id,
             primitive,
             findings,
+            coverage: None,
             outcome,
         }
     }
@@ -892,6 +909,7 @@ fn severity_rank(s: Severity) -> u8 {
 pub struct GateRunBuilder {
     findings: Vec<Finding>,
     untrustworthy: Option<UntrustworthyReason>,
+    coverage: Option<GateCoverage>,
 }
 
 impl GateRunBuilder {
@@ -913,6 +931,11 @@ impl GateRunBuilder {
         }
     }
 
+    /// Attach coverage evidence to the resulting run.
+    pub fn coverage(&mut self, coverage: GateCoverage) {
+        self.coverage = Some(coverage);
+    }
+
     /// Whether any finding has been recorded.
     pub fn has_findings(&self) -> bool {
         !self.findings.is_empty()
@@ -925,10 +948,13 @@ impl GateRunBuilder {
                 gate_id,
                 primitive,
                 findings: self.findings,
+                coverage: self.coverage,
                 outcome: GateOutcome::Untrustworthy { reason, origin },
             };
         }
-        GateRun::with_findings(gate_id, primitive, self.findings, origin)
+        let mut run = GateRun::with_findings(gate_id, primitive, self.findings, origin);
+        run.coverage = self.coverage;
+        run
     }
 }
 

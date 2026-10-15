@@ -134,6 +134,18 @@ impl Report<'_> {
                     }
                 }
             }
+            if let Some(coverage) = &run.coverage {
+                out.push_str(&format!(
+                    "           coverage: {} ({} inspected, {} required)\n",
+                    if coverage.complete {
+                        "complete"
+                    } else {
+                        "incomplete"
+                    },
+                    coverage.inspected_paths.len(),
+                    coverage.required_paths.len(),
+                ));
+            }
         }
         out.push('\n');
         out.push_str(&format!("verdict: {}\n", self.verdict));
@@ -212,6 +224,13 @@ impl Report<'_> {
                 outcome: outcome_name(&r.outcome),
                 origin: r.outcome.origin().map(origin_json),
                 finding_count: r.findings.len(),
+                coverage: r.coverage.as_ref().map(|coverage| {
+                    serde_json::json!({
+                        "inspectedPaths": coverage.inspected_paths,
+                        "requiredPaths": coverage.required_paths,
+                        "complete": coverage.complete,
+                    })
+                }),
             })
             .collect();
         gates.sort_by(|a, b| a.gate_id.cmp(&b.gate_id));
@@ -337,7 +356,17 @@ impl Report<'_> {
                     // The gates that audit the contract are not in the
                     // contract. Saying so in the artefact stops a reader
                     // wondering where they were configured.
-                    "builtInGates": ["contract_not_loosened", "contract_review_stale"],
+                "builtInGates": ["contract_not_loosened", "contract_review_stale"],
+                "gateCoverage": self.runs.iter().filter_map(|run| {
+                    run.coverage.as_ref().map(|coverage| (
+                        run.gate_id.to_string(),
+                        serde_json::json!({
+                            "inspectedPaths": coverage.inspected_paths,
+                            "requiredPaths": coverage.required_paths,
+                            "complete": coverage.complete,
+                        }),
+                    ))
+                }).collect::<serde_json::Map<_, _>>(),
                 },
             }],
         })
@@ -566,4 +595,6 @@ struct GateJson {
     origin: Option<serde_json::Value>,
     #[serde(rename = "findingCount")]
     finding_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    coverage: Option<serde_json::Value>,
 }

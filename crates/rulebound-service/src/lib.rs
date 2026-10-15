@@ -847,6 +847,21 @@ fn run_embedded(
         analyzer_fingerprint: result.analyzer_fingerprint.clone(),
     };
     let mut builder = GateRunBuilder::new();
+    let required_covered = result
+        .coverage
+        .required_paths
+        .is_subset(&result.coverage.inspected_paths);
+    let declared_paths_exist = result
+        .coverage
+        .inspected_paths
+        .iter()
+        .all(|path| baseline.entry(path).is_some() || candidate.entry(path).is_some());
+    let coverage_complete = result.coverage.complete && required_covered && declared_paths_exist;
+    builder.coverage(rulebound_orchestrate::GateCoverage {
+        inspected_paths: result.coverage.inspected_paths.iter().cloned().collect(),
+        required_paths: result.coverage.required_paths.iter().cloned().collect(),
+        complete: coverage_complete,
+    });
     if options.cancellation.is_cancelled() {
         builder.untrustworthy(UntrustworthyReason::Cancelled);
     } else if started.elapsed() > options.resource_limits.max_elapsed {
@@ -862,17 +877,7 @@ fn run_embedded(
             ),
         });
     }
-    if !result.coverage.complete
-        || !result
-            .coverage
-            .required_paths
-            .is_subset(&result.coverage.inspected_paths)
-        || result
-            .coverage
-            .required_paths
-            .iter()
-            .any(|path| baseline.entry(path).is_none() && candidate.entry(path).is_none())
-    {
+    if !coverage_complete {
         builder.untrustworthy(UntrustworthyReason::ProviderCoverageIncomplete {
             provider: provider_id.to_string(),
             detail: "provider did not inspect every path required for complete coverage"
