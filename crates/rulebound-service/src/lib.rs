@@ -47,6 +47,22 @@ pub struct Evaluation {
     pub observation_fingerprint: Option<String>,
     /// Fingerprint of the original contract bytes, when provided.
     pub contract_fingerprint: Option<String>,
+    /// Trust failures detected while evaluating supplied snapshots.
+    pub trust_failures: Vec<EvaluationTrustFailure>,
+}
+
+/// A trust failure that invalidates an otherwise completed evaluation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EvaluationTrustFailure {
+    /// A check changed a declared candidate input in the execution root.
+    CandidateMutated {
+        /// Identity supplied by the caller.
+        expected: SnapshotIdentity,
+        /// Identity observed after checks completed.
+        actual: SnapshotIdentity,
+    },
+    /// The execution root could not be read after checks completed.
+    ExecutionRootUnavailable(SnapshotError),
 }
 
 /// Typed failure while preparing a caller supplied snapshot evaluation.
@@ -261,6 +277,7 @@ pub fn evaluate(
         candidate_identity: observation.candidate_identity.clone(),
         observation_fingerprint: observation_fingerprint(observation),
         contract_fingerprint: None,
+        trust_failures: Vec::new(),
     }
 }
 
@@ -317,6 +334,27 @@ pub fn evaluate_snapshots(
     let mut evaluation = evaluate(request.contract, &observation, request.options);
     evaluation.contract_fingerprint =
         Some(blake3::hash(request.contract_bytes).to_hex().to_string());
+    match Snapshot::from_directory(
+        &request.options.execution_root,
+        &request.ignored_execution_paths,
+    ) {
+        Ok(after) if after.identity() != request.candidate.identity() => {
+            evaluation
+                .trust_failures
+                .push(EvaluationTrustFailure::CandidateMutated {
+                    expected: request.candidate.identity().clone(),
+                    actual: after.identity().clone(),
+                });
+            evaluation.verdict = Verdict::Error;
+        }
+        Ok(_) => {}
+        Err(error) => {
+            evaluation
+                .trust_failures
+                .push(EvaluationTrustFailure::ExecutionRootUnavailable(error));
+            evaluation.verdict = Verdict::Error;
+        }
+    }
     Ok(evaluation)
 }
 
