@@ -102,6 +102,18 @@ pub enum UntrustworthyReason {
         /// The provider identifier from the contract.
         provider: String,
     },
+    /// The provider requires configuration that the gate did not declare.
+    ProviderConfigurationRequired {
+        /// The provider identifier.
+        provider: String,
+    },
+    /// The declared provider policy could not be parsed or validated.
+    ProviderInvalidPolicy {
+        /// The provider identifier.
+        provider: String,
+        /// Policy validation details.
+        detail: String,
+    },
     /// A provider returned incomplete required coverage.
     ProviderCoverageIncomplete {
         /// The provider identifier.
@@ -146,6 +158,8 @@ impl UntrustworthyReason {
             | Self::Indeterminate { detail }
             | Self::ContractInvalid { detail } => detail,
             Self::ProviderUnavailable { provider } => provider,
+            Self::ProviderConfigurationRequired { provider } => provider,
+            Self::ProviderInvalidPolicy { detail, .. } => detail,
             Self::ProviderCoverageIncomplete { detail, .. }
             | Self::ProviderArtifactIncompatible { detail, .. } => detail,
             Self::Cancelled => "evaluation was cancelled",

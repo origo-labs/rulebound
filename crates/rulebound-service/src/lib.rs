@@ -790,14 +790,15 @@ fn run_embedded(
         Some(path) => match candidate.entry(path) {
             Some(entry) => Some(entry.content()),
             None => {
-                return untrustworthy(UntrustworthyReason::Indeterminate {
-                    detail: format!("provider policy file {path:?} is absent from candidate"),
+                return untrustworthy(UntrustworthyReason::ProviderInvalidPolicy {
+                    provider: provider_id.to_string(),
+                    detail: format!("declared policy file {path:?} is absent from candidate"),
                 });
             }
         },
         None if provider.configuration_required() => {
-            return untrustworthy(UntrustworthyReason::Indeterminate {
-                detail: "provider requires a declared policy_path".to_string(),
+            return untrustworthy(UntrustworthyReason::ProviderConfigurationRequired {
+                provider: provider_id.to_string(),
             });
         }
         None => None,
@@ -835,6 +836,17 @@ fn run_embedded(
             return untrustworthy(UntrustworthyReason::ProviderArtifactIncompatible {
                 provider: provider_id.to_string(),
                 detail,
+            });
+        }
+        Err(EmbeddedProviderError::InvalidPolicy(detail)) => {
+            return untrustworthy(UntrustworthyReason::ProviderInvalidPolicy {
+                provider: provider_id.to_string(),
+                detail,
+            });
+        }
+        Err(EmbeddedProviderError::ConfigurationRequired) => {
+            return untrustworthy(UntrustworthyReason::ProviderConfigurationRequired {
+                provider: provider_id.to_string(),
             });
         }
         Err(error) => {
