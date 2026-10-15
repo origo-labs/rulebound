@@ -224,6 +224,7 @@ impl Report<'_> {
                 outcome: outcome_name(&r.outcome),
                 origin: r.outcome.origin().map(origin_json),
                 finding_count: r.findings.len(),
+                detail: outcome_detail(&r.outcome),
                 coverage: r.coverage.as_ref().map(|coverage| {
                     serde_json::json!({
                         "inspectedPaths": coverage.inspected_paths,
@@ -241,6 +242,7 @@ impl Report<'_> {
             JSON_TARGET_KEYS[0]: {
                 "verdict": self.verdict.to_string(),
                 "exit_code": self.verdict.exit_code(),
+                "rulebound_version": self.tool_version,
                 "gates": gates,
                 "budget_bytes": self.contract.budget_observation_bytes,
                 "baseline": self.contract.baseline_ref,
@@ -275,7 +277,7 @@ impl Report<'_> {
     pub fn json_value_with_context(&self, context: &ReportContext) -> serde_json::Value {
         let mut value = self.json_value();
         value["schemaVersion"] = serde_json::Value::String(REPORT_SCHEMA_VERSION.to_string());
-        value["evaluation"] = context_json(context, self.runs);
+        value["evaluation"] = context_json(context, self.runs, self.tool_version);
         value
     }
 
@@ -351,12 +353,22 @@ impl Report<'_> {
                 // what was not checked without opening the contract.
                 "properties": {
                     "verdict": self.verdict.to_string(),
+                    "exitCode": self.verdict.exit_code(),
+                    "ruleboundVersion": self.tool_version,
                     "notCovered": self.contract.judgement.not_covered,
                     "reviewed": self.contract.judgement.reviewed,
                     // The gates that audit the contract are not in the
                     // contract. Saying so in the artefact stops a reader
                     // wondering where they were configured.
-                "builtInGates": ["contract_not_loosened", "contract_review_stale"],
+                    "builtInGates": ["contract_not_loosened", "contract_review_stale"],
+                    "gateOutcomes": self.runs.iter().map(|run| serde_json::json!({
+                        "gateId": run.gate_id.to_string(),
+                        "primitive": run.primitive.to_string(),
+                        "outcome": outcome_name(&run.outcome),
+                        "detail": outcome_detail(&run.outcome),
+                        "origin": run.outcome.origin().map(origin_json),
+                        "findingCount": run.findings.len(),
+                    })).collect::<Vec<_>>(),
                 "gateCoverage": self.runs.iter().filter_map(|run| {
                     run.coverage.as_ref().map(|coverage| (
                         run.gate_id.to_string(),
@@ -387,13 +399,13 @@ impl Report<'_> {
         {
             run["properties"]["schemaVersion"] =
                 serde_json::Value::String(REPORT_SCHEMA_VERSION.to_string());
-            run["properties"]["evaluation"] = context_json(context, self.runs);
+            run["properties"]["evaluation"] = context_json(context, self.runs, self.tool_version);
         }
         value
     }
 }
 
-fn context_json(context: &ReportContext, runs: &[GateRun]) -> serde_json::Value {
+fn context_json(context: &ReportContext, runs: &[GateRun], version: &str) -> serde_json::Value {
     let mut providers = Vec::new();
     for run in runs {
         if let Some(Origin::Embedded {
@@ -414,6 +426,7 @@ fn context_json(context: &ReportContext, runs: &[GateRun]) -> serde_json::Value 
     }
     serde_json::json!({
         "baselineCommit": context.baseline_commit,
+        "ruleboundVersion": version,
         "candidateIdentity": context.candidate_identity,
         "observationFingerprint": context.observation_fingerprint,
         "contractFingerprint": context.contract_fingerprint,
@@ -596,5 +609,22 @@ struct GateJson {
     #[serde(rename = "findingCount")]
     finding_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     coverage: Option<serde_json::Value>,
+}
+
+fn outcome_detail(outcome: &GateOutcome) -> Option<serde_json::Value> {
+    match outcome {
+        GateOutcome::Untrustworthy { reason, .. } => Some(serde_json::json!({
+            "kind": "untrustworthy",
+            "reason": format!("{reason:?}"),
+            "detail": reason.detail(),
+        })),
+        GateOutcome::Skipped { reason } => Some(serde_json::json!({
+            "kind": "skipped",
+            "reason": format!("{reason:?}"),
+        })),
+        GateOutcome::Pass { .. } | GateOutcome::Fail(_) => None,
+    }
 }
