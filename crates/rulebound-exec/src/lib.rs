@@ -57,6 +57,10 @@ fn signal_of(status: &std::process::ExitStatus) -> i32 {
 /// that a finished tool is not noticeably delayed, and long enough that a
 /// run spawning several processes does not spend its time in `sleep`.
 const POLL: Duration = Duration::from_millis(10);
+/// Maximum bytes retained from each child output stream.
+pub const MAX_CAPTURED_OUTPUT_BYTES: usize = 2 * 1024 * 1024;
+/// Marker appended when a child output stream exceeds the capture limit.
+pub const OUTPUT_TRUNCATION_MARKER: &str = "\n[rulebound: child output truncated]\n";
 
 /// The captured result of one delegated process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -496,20 +500,8 @@ fn run_at_with_environment_and_cancellation(
     // reading, which is the exact failure mode this crate exists to avoid.
     let mut out_pipe = child.stdout.take();
     let mut err_pipe = child.stderr.take();
-    let out_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = out_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        String::from_utf8_lossy(&buf).into_owned()
-    });
-    let err_handle = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(p) = err_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
-        }
-        String::from_utf8_lossy(&buf).into_owned()
-    });
+    let out_handle = std::thread::spawn(move || capture_output(out_pipe.as_mut()));
+    let err_handle = std::thread::spawn(move || capture_output(err_pipe.as_mut()));
 
     let deadline = Instant::now() + timeout;
     let outcome = loop {
@@ -547,14 +539,38 @@ fn run_at_with_environment_and_cancellation(
         std::thread::sleep(POLL);
     };
 
-    let stdout = out_handle.join().unwrap_or_default();
-    let stderr = err_handle.join().unwrap_or_default();
+    let (stdout, _) = out_handle.join().unwrap_or_default();
+    let (stderr, _) = err_handle.join().unwrap_or_default();
 
     Completed {
         status: outcome,
         stdout,
         stderr,
     }
+}
+
+fn capture_output(pipe: Option<&mut impl Read>) -> (String, bool) {
+    let mut output = Vec::with_capacity(MAX_CAPTURED_OUTPUT_BYTES);
+    let mut buffer = [0_u8; 8192];
+    let mut truncated = false;
+    if let Some(pipe) = pipe {
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => {
+                    let remaining = MAX_CAPTURED_OUTPUT_BYTES.saturating_sub(output.len());
+                    let retained = count.min(remaining);
+                    output.extend_from_slice(&buffer[..retained]);
+                    truncated |= retained < count;
+                }
+            }
+        }
+    }
+    let mut text = String::from_utf8_lossy(&output).into_owned();
+    if truncated {
+        text.push_str(OUTPUT_TRUNCATION_MARKER);
+    }
+    (text, truncated)
 }
 
 /// Substitute `{base}`, `{head}` and `{index}` in a configured argument list.
@@ -703,6 +719,20 @@ mod tests {
             &["-c".to_string(), script.to_string()],
             Duration::from_secs(10),
         )
+    }
+
+    #[test]
+    fn oversized_child_output_is_drained_but_bounded_and_marked() {
+        let bytes = vec![b'x'; MAX_CAPTURED_OUTPUT_BYTES + 1];
+        let mut reader = std::io::Cursor::new(bytes);
+        let (captured, truncated) = capture_output(Some(&mut reader));
+
+        assert!(truncated);
+        assert!(captured.ends_with(OUTPUT_TRUNCATION_MARKER));
+        assert_eq!(
+            captured.len(),
+            MAX_CAPTURED_OUTPUT_BYTES + OUTPUT_TRUNCATION_MARKER.len()
+        );
     }
 
     #[test]

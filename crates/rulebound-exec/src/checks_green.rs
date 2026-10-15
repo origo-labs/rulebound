@@ -157,7 +157,8 @@ fn run_checks_at(
             environment_names: environment.map_or_else(Vec::new, EnvironmentPolicy::allowed_names),
             stdout: completed.stdout.clone(),
             stderr: completed.stderr.clone(),
-            output_truncated: false,
+            output_truncated: completed.stdout.contains(crate::OUTPUT_TRUNCATION_MARKER)
+                || completed.stderr.contains(crate::OUTPUT_TRUNCATION_MARKER),
         });
         apply(&mut builder, check, completed, &origin);
     }
@@ -202,7 +203,8 @@ fn list_tests(
         environment_names: environment.map_or_else(Vec::new, EnvironmentPolicy::allowed_names),
         stdout: completed.stdout.clone(),
         stderr: completed.stderr.clone(),
-        output_truncated: false,
+        output_truncated: completed.stdout.contains(crate::OUTPUT_TRUNCATION_MARKER)
+            || completed.stderr.contains(crate::OUTPUT_TRUNCATION_MARKER),
     });
     // An inventory we could not read is an empty one, and the consuming gate
     // has to be able to tell that from a build with no tests. `checks_green`
