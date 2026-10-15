@@ -260,12 +260,33 @@ pub struct Evaluation {
     pub candidate_identity: Option<SnapshotIdentity>,
     /// Fingerprint of the complete observation coverage and clipping state.
     pub observation_fingerprint: Option<String>,
+    /// Changed input paths with full-content digests and snapshot modes.
+    pub changed_files: Vec<EvaluatedFile>,
+    /// Human-readable observation diff, clipped only for presentation.
+    pub rendered_diff: String,
+    /// Whether the rendered diff was clipped to the observation budget.
+    pub rendered_diff_truncated: bool,
     /// Fingerprint of the original contract bytes, when provided.
     pub contract_fingerprint: Option<String>,
     /// Trust failures detected while evaluating supplied snapshots.
     pub trust_failures: Vec<EvaluationTrustFailure>,
     /// Allowed environment variable names observed for this evaluation.
     pub allowed_environment_names: Vec<String>,
+}
+
+/// Digest and mode evidence for one changed observation path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EvaluatedFile {
+    /// Repository-relative path.
+    pub path: String,
+    /// Full baseline content digest, when the path existed.
+    pub baseline_digest: Option<String>,
+    /// Full candidate content digest, when the path exists.
+    pub candidate_digest: Option<String>,
+    /// Baseline snapshot mode, when snapshots were supplied.
+    pub baseline_mode: Option<u32>,
+    /// Candidate snapshot mode, when snapshots were supplied.
+    pub candidate_mode: Option<u32>,
 }
 
 /// A trust failure that invalidates an otherwise completed evaluation.
@@ -528,10 +549,41 @@ pub fn evaluate_with_providers(
         baseline_identity: observation.baseline_identity.clone(),
         candidate_identity: observation.candidate_identity.clone(),
         observation_fingerprint: observation_fingerprint(observation),
+        changed_files: evaluated_files(observation, baseline, candidate),
+        rendered_diff: observation.diff.text.clone(),
+        rendered_diff_truncated: observation.diff.truncated,
         contract_fingerprint: None,
         trust_failures: Vec::new(),
         allowed_environment_names: options.environment.allowed_names(),
     }
+}
+
+fn evaluated_files(
+    observation: &Observation,
+    baseline: Option<&Snapshot>,
+    candidate: Option<&Snapshot>,
+) -> Vec<EvaluatedFile> {
+    observation
+        .files
+        .iter()
+        .map(|file| EvaluatedFile {
+            path: file.path.clone(),
+            baseline_digest: file
+                .base
+                .as_deref()
+                .map(|content| blake3::hash(content.as_bytes()).to_hex().to_string()),
+            candidate_digest: file
+                .head
+                .as_deref()
+                .map(|content| blake3::hash(content.as_bytes()).to_hex().to_string()),
+            baseline_mode: baseline
+                .and_then(|snapshot| snapshot.entry(&file.path))
+                .map(|entry| entry.mode()),
+            candidate_mode: candidate
+                .and_then(|snapshot| snapshot.entry(&file.path))
+                .map(|entry| entry.mode()),
+        })
+        .collect()
 }
 
 /// Evaluate supplied snapshots after verifying the candidate contract and

@@ -213,6 +213,19 @@ fn run(cli: Cli) -> Result<Verdict, String> {
             .map(ToString::to_string),
         observation_fingerprint: evaluation.observation_fingerprint.clone(),
         contract_fingerprint: evaluation.contract_fingerprint.clone(),
+        changed_files: evaluation
+            .changed_files
+            .iter()
+            .map(|file| rulebound_report::FileEvidence {
+                path: file.path.clone(),
+                baseline_digest: file.baseline_digest.clone(),
+                candidate_digest: file.candidate_digest.clone(),
+                baseline_mode: file.baseline_mode,
+                candidate_mode: file.candidate_mode,
+            })
+            .collect(),
+        rendered_diff: evaluation.rendered_diff.clone(),
+        rendered_diff_truncated: evaluation.rendered_diff_truncated,
         evaluated_at_unix: evaluation_now,
         cargo_version,
         external_tool_version: tool_version,

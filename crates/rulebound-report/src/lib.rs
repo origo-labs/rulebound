@@ -43,6 +43,12 @@ pub struct ReportContext {
     pub observation_fingerprint: Option<String>,
     /// Fingerprint of the original contract bytes.
     pub contract_fingerprint: Option<String>,
+    /// Changed paths and their full-content identity evidence.
+    pub changed_files: Vec<FileEvidence>,
+    /// Bounded, human-readable observation diff.
+    pub rendered_diff: String,
+    /// Whether the observation diff was clipped.
+    pub rendered_diff_truncated: bool,
     /// Caller supplied Unix timestamp for the evaluation.
     pub evaluated_at_unix: i64,
     /// Cargo version used for delegated checks.
@@ -53,6 +59,21 @@ pub struct ReportContext {
     pub allowed_environment_names: Vec<String>,
     /// Snapshot trust failures discovered during evaluation.
     pub trust_failures: Vec<String>,
+}
+
+/// Full-content identity evidence for one changed path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEvidence {
+    /// Repository-relative path.
+    pub path: String,
+    /// Baseline content digest, when the path existed.
+    pub baseline_digest: Option<String>,
+    /// Candidate content digest, when the path exists.
+    pub candidate_digest: Option<String>,
+    /// Baseline snapshot mode, when available.
+    pub baseline_mode: Option<u32>,
+    /// Candidate snapshot mode, when available.
+    pub candidate_mode: Option<u32>,
 }
 
 /// The three targets, as top-level JSON keys.
@@ -183,6 +204,14 @@ impl Report<'_> {
             "schema_version: {REPORT_SCHEMA_VERSION}\nbaseline_commit: {}\n",
             context.baseline_commit
         ));
+        output.push_str(&format!(
+            "changed_files: {} (diff truncated: {})\n",
+            context.changed_files.len(),
+            context.rendered_diff_truncated,
+        ));
+        for file in &context.changed_files {
+            output.push_str(&format!("  - {}\n", file.path));
+        }
         output.push_str(&format!(
             "candidate_identity: {}\nobservation_fingerprint: {}\ncontract_fingerprint: {}\nevaluated_at_unix: {}\n",
             context.candidate_identity.as_deref().unwrap_or("<unavailable>"),
@@ -442,6 +471,17 @@ fn context_json(context: &ReportContext, runs: &[GateRun], version: &str) -> ser
         "candidateIdentity": context.candidate_identity,
         "observationFingerprint": context.observation_fingerprint,
         "contractFingerprint": context.contract_fingerprint,
+        "changedFiles": context.changed_files.iter().map(|file| serde_json::json!({
+            "path": file.path,
+            "baselineDigest": file.baseline_digest,
+            "candidateDigest": file.candidate_digest,
+            "baselineMode": file.baseline_mode,
+            "candidateMode": file.candidate_mode,
+        })).collect::<Vec<_>>(),
+        "diff": {
+            "text": context.rendered_diff,
+            "truncated": context.rendered_diff_truncated,
+        },
         "evaluatedAtUnix": context.evaluated_at_unix,
         "platform": {"os": std::env::consts::OS, "architecture": std::env::consts::ARCH},
         "toolchain": {"cargo": context.cargo_version, "externalTool": context.external_tool_version},

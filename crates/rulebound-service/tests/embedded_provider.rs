@@ -172,6 +172,15 @@ fn registered_provider_findings_keep_source_provenance() {
         "source-fingerprint"
     );
     assert!(run.coverage.as_ref().expect("coverage").complete);
+    let changed_source = evaluation
+        .changed_files
+        .iter()
+        .find(|file| file.path == "src/lib.rs")
+        .expect("changed source evidence");
+    assert!(changed_source.baseline_digest.is_some());
+    assert!(changed_source.candidate_digest.is_some());
+    assert_eq!(changed_source.baseline_mode, Some(0o100644));
+    assert_eq!(changed_source.candidate_mode, Some(0o100644));
 }
 
 #[test]
