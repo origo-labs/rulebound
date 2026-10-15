@@ -187,6 +187,8 @@ fn run(cli: Cli) -> Result<Verdict, String> {
             now_unix: unix_now(),
             cargo_version,
             external_tool_version: tool_version,
+            cancellation: rulebound_service::CancellationToken::default(),
+            resource_limits: rulebound_service::ResourceLimits::default(),
         },
     );
 

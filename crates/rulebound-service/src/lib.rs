@@ -4,7 +4,10 @@
 //! Git-backed observation flow, while embedded callers can provide explicit
 //! snapshots through the validated snapshot request API.
 
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{error::Error, fmt};
 
@@ -13,6 +16,227 @@ use rulebound_gates::{GateContext, GateResult, registry};
 use rulebound_observe::snapshot::{Snapshot, SnapshotError, SnapshotIdentity};
 use rulebound_observe::{Budget, Observation, SnapshotObservationError};
 use rulebound_orchestrate::{GateRun, ReductionInput, Verdict, reduce};
+
+/// Cooperative cancellation signal for embedded providers.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    /// Request cancellation from the provider.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
+
+/// Resource bounds passed to each embedded provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResourceLimits {
+    /// Maximum total baseline, candidate, and policy bytes supplied to one
+    /// provider.
+    pub max_provider_input_bytes: usize,
+    /// Maximum findings a provider may return for one gate.
+    pub max_findings: usize,
+    /// Cooperative time budget for provider analysis.
+    pub max_elapsed: Duration,
+}
+
+impl Default for ResourceLimits {
+    fn default() -> Self {
+        Self {
+            max_provider_input_bytes: 64 * 1024 * 1024,
+            max_findings: 10_000,
+            max_elapsed: Duration::from_secs(900),
+        }
+    }
+}
+
+/// Inputs visible to an embedded provider for one declared gate.
+#[derive(Debug)]
+pub struct EmbeddedProviderRequest<'a> {
+    /// Gate declaration being evaluated.
+    pub gate: &'a Gate,
+    /// Complete baseline snapshot.
+    pub baseline: &'a Snapshot,
+    /// Complete candidate snapshot.
+    pub candidate: &'a Snapshot,
+    /// Full candidate policy bytes, if `policy_path` was declared.
+    pub policy_bytes: Option<&'a [u8]>,
+    /// Cooperative cancellation signal.
+    pub cancellation: &'a CancellationToken,
+    /// Resource bounds for this invocation.
+    pub limits: &'a ResourceLimits,
+}
+
+/// Provider finding before Rulebound assigns gate identity and consequence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedFinding {
+    /// Original analyzer rule identifier.
+    pub rule_id: String,
+    /// Original stable finding fingerprint.
+    pub fingerprint: String,
+    /// Original source severity, preserved as provided.
+    pub source_severity: String,
+    /// Human readable description.
+    pub message: String,
+    /// Primary repository-relative location.
+    pub path: Option<String>,
+    /// Primary 1-based source line.
+    pub line: Option<u32>,
+    /// Optional expected value.
+    pub expected: Option<String>,
+    /// Optional observed value.
+    pub observed: Option<String>,
+    /// Additional source locations related to the finding.
+    pub related_locations: Vec<rulebound_orchestrate::RelatedLocation>,
+}
+
+/// Coverage and result completeness returned by an embedded provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCoverage {
+    /// Snapshot paths the provider inspected.
+    pub inspected_paths: BTreeSet<String>,
+    /// Paths that the provider declares necessary for a complete result.
+    pub required_paths: BTreeSet<String>,
+    /// Whether provider-internal analysis completed successfully.
+    pub complete: bool,
+}
+
+/// Typed findings, coverage, and identity returned by an embedded provider.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedProviderResult {
+    /// Every finding, without collapsing by severity.
+    pub findings: Vec<EmbeddedFinding>,
+    /// Coverage and completeness evidence.
+    pub coverage: ProviderCoverage,
+    /// Effective policy fingerprint used for this run.
+    pub effective_policy_fingerprint: String,
+    /// Provider implementation version.
+    pub implementation_version: String,
+    /// Analyzer identity, such as a model or engine name.
+    pub analyzer_identity: String,
+    /// Fingerprint of the analyzer implementation and configuration.
+    pub analyzer_fingerprint: String,
+}
+
+/// Errors an embedded provider can return without panicking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EmbeddedProviderError {
+    /// The provider requires a policy file but none was declared.
+    ConfigurationRequired,
+    /// The supplied policy bytes were invalid for this provider.
+    InvalidPolicy(String),
+    /// A baseline index or other supplied artifact is incompatible.
+    IncompatibleArtifact(String),
+    /// The provider observed cooperative cancellation.
+    Cancelled,
+    /// Analysis could not produce a trustworthy result.
+    Analysis(String),
+}
+
+impl fmt::Display for EmbeddedProviderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ConfigurationRequired => f.write_str("provider policy is required"),
+            Self::InvalidPolicy(detail) => write!(f, "invalid provider policy: {detail}"),
+            Self::IncompatibleArtifact(detail) => {
+                write!(f, "incompatible provider artifact: {detail}")
+            }
+            Self::Cancelled => f.write_str("provider analysis was cancelled"),
+            Self::Analysis(detail) => f.write_str(detail),
+        }
+    }
+}
+
+impl Error for EmbeddedProviderError {}
+
+/// Public interface implemented by consumer-crate embedded analyzers.
+pub trait EmbeddedCheckProvider: Send + Sync {
+    /// Whether this provider requires the contract to declare `policy_path`.
+    fn configuration_required(&self) -> bool;
+
+    /// Analyze one gate using the supplied snapshots and policy bytes.
+    ///
+    /// Implementations must honor cancellation cooperatively and must not
+    /// spawn an unbounded worker that outlives this call.
+    fn analyze(
+        &self,
+        request: EmbeddedProviderRequest<'_>,
+    ) -> Result<EmbeddedProviderResult, EmbeddedProviderError>;
+}
+
+/// Explicit set of embedded providers available to one evaluation.
+#[derive(Clone, Default)]
+pub struct ProviderRegistry {
+    providers: BTreeMap<String, Arc<dyn EmbeddedCheckProvider>>,
+}
+
+impl fmt::Debug for ProviderRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProviderRegistry")
+            .field("provider_ids", &self.providers.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// Why a provider could not be registered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderRegistrationError {
+    /// The identifier is not a valid provider key.
+    InvalidIdentifier(String),
+    /// A provider with the same identifier is already registered.
+    DuplicateIdentifier(String),
+}
+
+impl fmt::Display for ProviderRegistrationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InvalidIdentifier(id) => write!(f, "invalid provider identifier {id:?}"),
+            Self::DuplicateIdentifier(id) => write!(f, "provider {id:?} is already registered"),
+        }
+    }
+}
+
+impl Error for ProviderRegistrationError {}
+
+impl ProviderRegistry {
+    /// Register one provider under its contract identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for invalid or duplicate identifiers.
+    pub fn register(
+        &mut self,
+        id: impl Into<String>,
+        provider: Arc<dyn EmbeddedCheckProvider>,
+    ) -> Result<(), ProviderRegistrationError> {
+        let id = id.into();
+        if !valid_provider_id(&id) {
+            return Err(ProviderRegistrationError::InvalidIdentifier(id));
+        }
+        if self.providers.contains_key(&id) {
+            return Err(ProviderRegistrationError::DuplicateIdentifier(id));
+        }
+        self.providers.insert(id, provider);
+        Ok(())
+    }
+
+    fn get(&self, id: &str) -> Option<&Arc<dyn EmbeddedCheckProvider>> {
+        self.providers.get(id)
+    }
+}
+
+fn valid_provider_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
 
 /// Inputs that the caller supplies to make an evaluation reproducible.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +255,10 @@ pub struct EvaluationOptions {
     pub cargo_version: String,
     /// External tool version recorded as delegated-check provenance.
     pub external_tool_version: String,
+    /// Cooperative cancellation shared with embedded providers.
+    pub cancellation: CancellationToken,
+    /// Resource bounds applied to embedded providers.
+    pub resource_limits: ResourceLimits,
 }
 
 /// Typed results from evaluating one contract against one observation.
@@ -132,6 +360,7 @@ pub struct SnapshotEvaluationRequest<'a> {
     observation_budget: Budget,
     expect_change: bool,
     ignored_execution_paths: Vec<String>,
+    providers: &'a ProviderRegistry,
 }
 
 impl<'a> SnapshotEvaluationRequest<'a> {
@@ -142,6 +371,7 @@ impl<'a> SnapshotEvaluationRequest<'a> {
         baseline: &'a Snapshot,
         candidate: &'a Snapshot,
         options: &'a EvaluationOptions,
+        providers: &'a ProviderRegistry,
     ) -> SnapshotEvaluationRequestBuilder<'a> {
         SnapshotEvaluationRequestBuilder {
             contract,
@@ -149,6 +379,7 @@ impl<'a> SnapshotEvaluationRequest<'a> {
             baseline,
             candidate,
             options,
+            providers,
             observation_budget: None,
             expect_change: false,
             ignored_execution_paths: Vec::new(),
@@ -164,6 +395,7 @@ pub struct SnapshotEvaluationRequestBuilder<'a> {
     baseline: &'a Snapshot,
     candidate: &'a Snapshot,
     options: &'a EvaluationOptions,
+    providers: &'a ProviderRegistry,
     observation_budget: Option<Budget>,
     expect_change: bool,
     ignored_execution_paths: Vec<String>,
@@ -203,6 +435,7 @@ impl<'a> SnapshotEvaluationRequestBuilder<'a> {
             baseline: self.baseline,
             candidate: self.candidate,
             options: self.options,
+            providers: self.providers,
             observation_budget,
             expect_change: self.expect_change,
             ignored_execution_paths: self.ignored_execution_paths,
@@ -229,6 +462,25 @@ pub fn evaluate(
     contract: &Contract,
     observation: &Observation,
     options: &EvaluationOptions,
+) -> Evaluation {
+    evaluate_with_providers(
+        contract,
+        observation,
+        options,
+        None,
+        None,
+        &ProviderRegistry::default(),
+    )
+}
+
+/// Evaluate a contract with optional complete snapshots and registered embedded providers.
+pub fn evaluate_with_providers(
+    contract: &Contract,
+    observation: &Observation,
+    options: &EvaluationOptions,
+    baseline: Option<&Snapshot>,
+    candidate: Option<&Snapshot>,
+    providers: &ProviderRegistry,
 ) -> Evaluation {
     let mut inventory: Option<rulebound_exec::test_inventory::TestInventory> = None;
     let mut runs = Vec::new();
@@ -258,7 +510,15 @@ pub fn evaluate(
         if gate.primitive == Primitive::ChecksGreen && inventory.is_some() {
             continue;
         }
-        runs.push(run_gate(gate, observation, options, inventory.as_ref()));
+        runs.push(run_gate(
+            gate,
+            observation,
+            options,
+            inventory.as_ref(),
+            baseline,
+            candidate,
+            providers,
+        ));
     }
 
     runs.extend(built_in_gates(observation, options));
@@ -338,7 +598,14 @@ pub fn evaluate_snapshots(
         request.expect_change,
     )
     .map_err(EvaluationError::Observation)?;
-    let mut evaluation = evaluate(request.contract, &observation, request.options);
+    let mut evaluation = evaluate_with_providers(
+        request.contract,
+        &observation,
+        request.options,
+        Some(request.baseline),
+        Some(request.candidate),
+        request.providers,
+    );
     evaluation.contract_fingerprint =
         Some(blake3::hash(request.contract_bytes).to_hex().to_string());
     match Snapshot::from_directory(
@@ -397,7 +664,15 @@ fn built_in_gates(observation: &Observation, options: &EvaluationOptions) -> Vec
             primitive,
         );
         gate.severity = Severity::Error;
-        run_gate(&gate, observation, options, None)
+        run_gate(
+            &gate,
+            observation,
+            options,
+            None,
+            None,
+            None,
+            &ProviderRegistry::default(),
+        )
     })
     .collect()
 }
@@ -407,6 +682,9 @@ fn run_gate(
     observation: &Observation,
     options: &EvaluationOptions,
     inventory: Option<&rulebound_exec::test_inventory::TestInventory>,
+    baseline: Option<&Snapshot>,
+    candidate: Option<&Snapshot>,
+    providers: &ProviderRegistry,
 ) -> GateRun {
     if gate.severity == Severity::Off {
         return GateRun::skipped(gate.id.clone(), gate.primitive);
@@ -463,18 +741,7 @@ fn run_gate(
         }
         Primitive::Embedded => {
             let provider = gate.provider.as_deref().unwrap_or("<missing>");
-            GateRun::untrustworthy(
-                gate.id.clone(),
-                gate.primitive,
-                rulebound_orchestrate::UntrustworthyReason::ProviderUnavailable {
-                    provider: provider.to_string(),
-                },
-                rulebound_orchestrate::Origin::Embedded {
-                    provider: provider.to_string(),
-                    version: String::new(),
-                    analyzer_fingerprint: String::new(),
-                },
-            )
+            run_embedded(gate, provider, options, baseline, candidate, providers)
         }
         primitive => {
             let result = registry::dispatch(
@@ -498,6 +765,229 @@ fn run_gate(
             }
         }
     }
+}
+
+fn run_embedded(
+    gate: &Gate,
+    provider_id: &str,
+    options: &EvaluationOptions,
+    baseline: Option<&Snapshot>,
+    candidate: Option<&Snapshot>,
+    providers: &ProviderRegistry,
+) -> GateRun {
+    use rulebound_orchestrate::{
+        EmbeddedFindingMetadata, GateRunBuilder, HunkRef, Origin, RelatedLocation, Side, Subject,
+        SubjectKind, UntrustworthyReason,
+    };
+
+    let fallback_origin = || Origin::Embedded {
+        provider: provider_id.to_string(),
+        version: String::new(),
+        analyzer_fingerprint: String::new(),
+    };
+    let untrustworthy =
+        |reason| GateRun::untrustworthy(gate.id.clone(), gate.primitive, reason, fallback_origin());
+    let Some(provider) = providers.get(provider_id) else {
+        return untrustworthy(UntrustworthyReason::ProviderUnavailable {
+            provider: provider_id.to_string(),
+        });
+    };
+    let (Some(baseline), Some(candidate)) = (baseline, candidate) else {
+        return untrustworthy(UntrustworthyReason::Indeterminate {
+            detail: "embedded providers require complete snapshots".to_string(),
+        });
+    };
+    let policy_bytes = match gate.policy_path.as_deref() {
+        Some(path) => match candidate.entry(path) {
+            Some(entry) => Some(entry.content()),
+            None => {
+                return untrustworthy(UntrustworthyReason::Indeterminate {
+                    detail: format!("provider policy file {path:?} is absent from candidate"),
+                });
+            }
+        },
+        None if provider.configuration_required() => {
+            return untrustworthy(UntrustworthyReason::Indeterminate {
+                detail: "provider requires a declared policy_path".to_string(),
+            });
+        }
+        None => None,
+    };
+    let input_bytes = baseline
+        .total_bytes()
+        .saturating_add(candidate.total_bytes())
+        .saturating_add(policy_bytes.map_or(0, <[u8]>::len));
+    if input_bytes > options.resource_limits.max_provider_input_bytes {
+        return untrustworthy(UntrustworthyReason::Indeterminate {
+            detail: format!(
+                "provider input exceeds {} byte limit",
+                options.resource_limits.max_provider_input_bytes
+            ),
+        });
+    }
+    if options.cancellation.is_cancelled() {
+        return untrustworthy(UntrustworthyReason::Cancelled);
+    }
+    let started = std::time::Instant::now();
+    let result = provider.analyze(EmbeddedProviderRequest {
+        gate,
+        baseline,
+        candidate,
+        policy_bytes,
+        cancellation: &options.cancellation,
+        limits: &options.resource_limits,
+    });
+    let result = match result {
+        Ok(result) => result,
+        Err(EmbeddedProviderError::Cancelled) => {
+            return untrustworthy(UntrustworthyReason::Cancelled);
+        }
+        Err(EmbeddedProviderError::IncompatibleArtifact(detail)) => {
+            return untrustworthy(UntrustworthyReason::ProviderArtifactIncompatible {
+                provider: provider_id.to_string(),
+                detail,
+            });
+        }
+        Err(error) => {
+            return untrustworthy(UntrustworthyReason::Indeterminate {
+                detail: format!("embedded provider {provider_id:?} failed: {error}"),
+            });
+        }
+    };
+    let origin = Origin::Embedded {
+        provider: provider_id.to_string(),
+        version: result.implementation_version.clone(),
+        analyzer_fingerprint: result.analyzer_fingerprint.clone(),
+    };
+    let mut builder = GateRunBuilder::new();
+    if options.cancellation.is_cancelled() {
+        builder.untrustworthy(UntrustworthyReason::Cancelled);
+    } else if started.elapsed() > options.resource_limits.max_elapsed {
+        builder.untrustworthy(UntrustworthyReason::Indeterminate {
+            detail: "embedded provider exceeded its elapsed-time limit".to_string(),
+        });
+    }
+    if result.findings.len() > options.resource_limits.max_findings {
+        builder.untrustworthy(UntrustworthyReason::Indeterminate {
+            detail: format!(
+                "embedded provider exceeded its {} finding limit",
+                options.resource_limits.max_findings
+            ),
+        });
+    }
+    if !result.coverage.complete
+        || !result
+            .coverage
+            .required_paths
+            .is_subset(&result.coverage.inspected_paths)
+        || result.coverage.required_paths.iter().any(|path| {
+            baseline.entry(path).is_none() && candidate.entry(path).is_none()
+        })
+    {
+        builder.untrustworthy(UntrustworthyReason::ProviderCoverageIncomplete {
+            provider: provider_id.to_string(),
+            detail: "provider did not inspect every path required for complete coverage"
+                .to_string(),
+        });
+    }
+    if result.implementation_version.is_empty()
+        || result.analyzer_identity.is_empty()
+        || result.analyzer_fingerprint.is_empty()
+        || result.effective_policy_fingerprint.is_empty()
+    {
+        builder.untrustworthy(UntrustworthyReason::Indeterminate {
+            detail: "provider returned incomplete provenance".to_string(),
+        });
+    }
+    for finding in result
+        .findings
+        .into_iter()
+        .take(options.resource_limits.max_findings)
+    {
+        if finding.line.is_some_and(|line| line == 0 || line == u32::MAX) {
+            builder.untrustworthy(UntrustworthyReason::Indeterminate {
+                detail: "provider returned an invalid source line".to_string(),
+            });
+            continue;
+        }
+        if finding.rule_id.is_empty() || finding.fingerprint.is_empty() {
+            builder.untrustworthy(UntrustworthyReason::Indeterminate {
+                detail: "provider returned a finding without rule identity or fingerprint"
+                    .to_string(),
+            });
+            continue;
+        }
+        let path = match finding.path.as_deref() {
+            Some(path) if candidate.entry(path).is_some() => {
+                match camino::Utf8PathBuf::from_path_buf(path.into()) {
+                    Ok(path) => Some(path),
+                    Err(_) => {
+                        builder.untrustworthy(UntrustworthyReason::Indeterminate {
+                            detail: "provider returned a non-UTF-8 location".to_string(),
+                        });
+                        continue;
+                    }
+                }
+            }
+            Some(path) => {
+                builder.untrustworthy(UntrustworthyReason::Indeterminate {
+                    detail: format!(
+                        "provider returned location outside candidate snapshot: {path:?}"
+                    ),
+                });
+                continue;
+            }
+            None => None,
+        };
+        let related_locations: Vec<RelatedLocation> = finding.related_locations;
+        if related_locations.iter().any(|location| {
+            candidate.entry(&location.path).is_none()
+                || location.start_line.is_some_and(|line| line == 0)
+                || location.end_line.is_some_and(|line| line == 0)
+                || location.start_line.is_some_and(|line| line == u32::MAX)
+                || location.end_line.is_some_and(|line| line == u32::MAX)
+                || matches!((location.start_line, location.end_line), (Some(start), Some(end)) if end < start)
+        })
+        {
+            builder.untrustworthy(UntrustworthyReason::Indeterminate {
+                detail: "provider returned a related location outside candidate snapshot"
+                    .to_string(),
+            });
+            continue;
+        }
+        let hunk = finding.line.map(|line| HunkRef {
+            start: line,
+            end: line,
+        });
+        let expected = finding.expected.map_or(Side::Absent, Side::Value);
+        let observed = finding.observed.map_or(Side::Absent, Side::Value);
+        let metadata = EmbeddedFindingMetadata {
+            rule_id: finding.rule_id.clone(),
+            source_fingerprint: finding.fingerprint,
+            source_severity: finding.source_severity,
+            analyzer_identity: result.analyzer_identity.clone(),
+            effective_policy_fingerprint: result.effective_policy_fingerprint.clone(),
+            related_locations,
+        };
+        let mapped = rulebound_orchestrate::Finding::new(
+            gate.id.clone(),
+            gate.primitive,
+            gate.severity,
+            Subject {
+                kind: SubjectKind::EmbeddedRule,
+                name: finding.rule_id,
+            },
+            path,
+            hunk,
+            expected,
+            observed,
+            finding.message,
+            origin.clone(),
+        )
+        .with_embedded_metadata(metadata);
+        builder.finding(mapped);
+    }
+    builder.finish(gate.id.clone(), gate.primitive, origin)
 }
 
 fn timeout(gate: &Gate) -> Duration {

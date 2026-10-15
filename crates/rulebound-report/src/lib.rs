@@ -329,6 +329,27 @@ fn finding_json(f: &Finding) -> serde_json::Value {
         "message": f.message,
         "fingerprint": f.fingerprint.to_string(),
         "origin": origin_json(&f.origin),
+        "embeddedFinding": f.embedded_metadata.as_ref().map(embedded_metadata_json),
+    })
+}
+
+fn embedded_metadata_json(
+    metadata: &rulebound_orchestrate::EmbeddedFindingMetadata,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ruleId": metadata.rule_id,
+        "fingerprint": metadata.source_fingerprint,
+        "sourceSeverity": metadata.source_severity,
+        "analyzerIdentity": metadata.analyzer_identity,
+        "effectivePolicyFingerprint": metadata.effective_policy_fingerprint,
+        "relatedLocations": metadata.related_locations.iter().map(|location| {
+            serde_json::json!({
+                "path": location.path,
+                "startLine": location.start_line,
+                "endLine": location.end_line,
+                "message": location.message,
+            })
+        }).collect::<Vec<_>>(),
     })
 }
 
@@ -359,7 +380,7 @@ fn result_json(f: &Finding, rule_id: &str, rule_index: usize) -> serde_json::Val
             "endLine": h.end + 1,
         });
     }
-    serde_json::json!({
+    let mut result = serde_json::json!({
         "ruleId": rule_id,
         "ruleIndex": rule_index,
         "level": level,
@@ -378,7 +399,34 @@ fn result_json(f: &Finding, rule_id: &str, rule_index: usize) -> serde_json::Val
             "origin": origin_json(&f.origin),
             "hunkInclusiveEnd": f.hunk.map(|h| h.end),
         },
-    })
+    });
+    if let Some(metadata) = &f.embedded_metadata {
+        result["properties"]["embeddedFinding"] = embedded_metadata_json(metadata);
+        result["relatedLocations"] = serde_json::Value::Array(
+            metadata
+                .related_locations
+                .iter()
+                .enumerate()
+                .map(|(index, location)| {
+                    let mut physical = serde_json::json!({
+                        "artifactLocation": {"uri": location.path},
+                    });
+                    if let Some(start) = location.start_line {
+                        physical["region"] = serde_json::json!({
+                            "startLine": start,
+                            "endLine": location.end_line.unwrap_or(start) + 1,
+                        });
+                    }
+                    serde_json::json!({
+                        "id": index + 1,
+                        "message": {"text": location.message.as_deref().unwrap_or("Related location")},
+                        "physicalLocation": physical,
+                    })
+                })
+                .collect(),
+        );
+    }
+    result
 }
 
 #[derive(Debug, Serialize)]

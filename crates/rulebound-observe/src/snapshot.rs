@@ -234,6 +234,14 @@ impl Snapshot {
         self.entries.len()
     }
 
+    /// Total content bytes across all declared entries.
+    pub fn total_bytes(&self) -> usize {
+        self.entries
+            .values()
+            .map(|entry| entry.content.len())
+            .fold(0usize, usize::saturating_add)
+    }
+
     /// Whether the snapshot contains no declared entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()

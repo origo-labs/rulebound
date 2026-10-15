@@ -98,6 +98,22 @@ pub enum UntrustworthyReason {
         /// The provider identifier from the contract.
         provider: String,
     },
+    /// A provider returned incomplete required coverage.
+    ProviderCoverageIncomplete {
+        /// The provider identifier.
+        provider: String,
+        /// Coverage details.
+        detail: String,
+    },
+    /// A provider could not use a supplied baseline index or artifact.
+    ProviderArtifactIncompatible {
+        /// The provider identifier.
+        provider: String,
+        /// Incompatibility details.
+        detail: String,
+    },
+    /// Evaluation or provider analysis was cancelled cooperatively.
+    Cancelled,
     /// A gate could not decide, e.g. a file it needed to parse did not parse.
     Indeterminate {
         /// What prevented a decision.
@@ -126,6 +142,9 @@ impl UntrustworthyReason {
             | Self::Indeterminate { detail }
             | Self::ContractInvalid { detail } => detail,
             Self::ProviderUnavailable { provider } => provider,
+            Self::ProviderCoverageIncomplete { detail, .. }
+            | Self::ProviderArtifactIncompatible { detail, .. } => detail,
+            Self::Cancelled => "evaluation was cancelled",
             Self::Unimplemented { primitive } => primitive.as_str(),
         }
     }
@@ -276,6 +295,39 @@ pub struct Finding {
     pub fingerprint: Fingerprint,
     /// Who produced it, derived from the producing outcome.
     pub origin: Origin,
+    /// Original analyzer fields retained when Rulebound maps an embedded
+    /// provider finding into its own consequence and verdict types.
+    pub embedded_metadata: Option<EmbeddedFindingMetadata>,
+}
+
+/// Analyzer metadata that Rulebound preserves alongside an embedded finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddedFindingMetadata {
+    /// Provider's original rule identifier.
+    pub rule_id: String,
+    /// Provider's original stable finding fingerprint.
+    pub source_fingerprint: String,
+    /// Provider's original severity spelling.
+    pub source_severity: String,
+    /// Analyzer identity associated with the finding.
+    pub analyzer_identity: String,
+    /// Fingerprint of the effective provider policy used for this run.
+    pub effective_policy_fingerprint: String,
+    /// Additional source locations supplied by the provider.
+    pub related_locations: Vec<RelatedLocation>,
+}
+
+/// A provider supplied related source location.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedLocation {
+    /// Repository-relative path.
+    pub path: String,
+    /// First 1-based source line, if known.
+    pub start_line: Option<u32>,
+    /// Last 1-based source line, if known.
+    pub end_line: Option<u32>,
+    /// Provider's description of the relationship.
+    pub message: Option<String>,
 }
 
 /// What a finding is about.
@@ -325,6 +377,8 @@ pub enum SubjectKind {
     Check,
     /// The contract itself.
     Contract,
+    /// A rule declared by an embedded analyzer.
+    EmbeddedRule,
 }
 
 impl SubjectKind {
@@ -341,6 +395,7 @@ impl SubjectKind {
             Self::Path => "path",
             Self::Check => "check",
             Self::Contract => "contract",
+            Self::EmbeddedRule => "embedded rule",
         }
     }
 }
@@ -501,7 +556,15 @@ impl Finding {
             message: message.into(),
             fingerprint,
             origin,
+            embedded_metadata: None,
         }
+    }
+
+    /// Attach original embedded analyzer fields without changing Rulebound's
+    /// finding fingerprint or verdict consequence.
+    pub fn with_embedded_metadata(mut self, metadata: EmbeddedFindingMetadata) -> Self {
+        self.embedded_metadata = Some(metadata);
+        self
     }
 
     /// What kind of change this finding describes, derived from the two sides.
