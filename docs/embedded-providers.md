@@ -32,6 +32,8 @@ Create complete baseline and candidate `Snapshot` values. The candidate snapshot
 
 The provider receives the gate, both snapshots, optional candidate policy bytes, a cooperative cancellation token, and resource limits. It returns findings, coverage, a policy fingerprint, implementation version, and analyzer identity. Rulebound maps each finding to the outer gate severity and retains the provider's rule ID, fingerprint, source severity, analyzer identity, and related locations.
 
+The `Evaluation` result lists every changed path with baseline and candidate content digests. It includes snapshot modes when the caller supplied snapshots, plus the bounded observation diff and its truncation flag. Include those values in `ReportContext` to render them in human, JSON, and SARIF reports. A declared policy file therefore appears among changed paths with its digests and available diff.
+
 For an enabled gate, coverage is incomplete when the provider marks the result incomplete or omits a required path from its inspected paths. Incomplete coverage makes the gate untrustworthy, regardless of the gate severity. A gate with severity `off` is skipped and does not invoke the provider.
 
 The time limit is checked after provider analysis returns. Providers must honor cancellation cooperatively; Rulebound does not terminate provider threads. Process checks also receive the cancellation token and terminate their direct child process. A provider should not leave background workers running after `analyze` returns.
