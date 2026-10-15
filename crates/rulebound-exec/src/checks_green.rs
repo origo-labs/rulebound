@@ -70,7 +70,7 @@ pub fn run_checks(
     rulebound_orchestrate::GateRun,
     crate::test_inventory::TestInventory,
 ) {
-    run_checks_at(origin, timeout, None, None)
+    run_checks_at(origin, timeout, None, None, None)
 }
 
 /// Run the built-in Cargo checks in a supplied project root.
@@ -86,7 +86,7 @@ pub fn run_checks_in(
     rulebound_orchestrate::GateRun,
     crate::test_inventory::TestInventory,
 ) {
-    run_checks_at(origin, timeout, Some(working_directory), None)
+    run_checks_at(origin, timeout, Some(working_directory), None, None)
 }
 
 /// Run the built-in Cargo checks with explicit working directory and
@@ -104,7 +104,33 @@ pub fn run_checks_in_with_environment(
     rulebound_orchestrate::GateRun,
     crate::test_inventory::TestInventory,
 ) {
-    run_checks_at(origin, timeout, Some(working_directory), Some(environment))
+    run_checks_at(
+        origin,
+        timeout,
+        Some(working_directory),
+        Some(environment),
+        None,
+    )
+}
+
+/// Run Cargo checks with explicit root, environment, and cooperative cancellation.
+pub fn run_checks_in_with_environment_and_cancellation(
+    origin: Origin,
+    timeout: Duration,
+    working_directory: &Path,
+    environment: &EnvironmentPolicy,
+    cancellation: &crate::CancellationToken,
+) -> (
+    rulebound_orchestrate::GateRun,
+    crate::test_inventory::TestInventory,
+) {
+    run_checks_at(
+        origin,
+        timeout,
+        Some(working_directory),
+        Some(environment),
+        Some(cancellation),
+    )
 }
 
 fn run_checks_at(
@@ -112,6 +138,7 @@ fn run_checks_at(
     timeout: Duration,
     working_directory: Option<&Path>,
     environment: Option<&EnvironmentPolicy>,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> (
     rulebound_orchestrate::GateRun,
     crate::test_inventory::TestInventory,
@@ -121,7 +148,13 @@ fn run_checks_at(
         apply(
             &mut builder,
             check,
-            run_cargo(&check.argv(), timeout, working_directory, environment),
+            run_cargo(
+                &check.argv(),
+                timeout,
+                working_directory,
+                environment,
+                cancellation,
+            ),
             &origin,
         );
     }
@@ -130,7 +163,10 @@ fn run_checks_at(
         rulebound_contract::Primitive::ChecksGreen,
         origin,
     );
-    (run, list_tests(timeout, working_directory, environment))
+    (
+        run,
+        list_tests(timeout, working_directory, environment, cancellation),
+    )
 }
 
 /// The test inventory: `cargo test -- --list`.
@@ -144,12 +180,14 @@ fn list_tests(
     timeout: Duration,
     working_directory: Option<&Path>,
     environment: Option<&EnvironmentPolicy>,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> crate::test_inventory::TestInventory {
     let completed = run_cargo(
         &["test".to_string(), "--".to_string(), "--list".to_string()],
         timeout,
         working_directory,
         environment,
+        cancellation,
     );
     // An inventory we could not read is an empty one, and the consuming gate
     // has to be able to tell that from a build with no tests. `checks_green`
@@ -170,7 +208,14 @@ fn run_cargo(
     timeout: Duration,
     working_directory: Option<&Path>,
     environment: Option<&EnvironmentPolicy>,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> Completed {
+    if let (Some(path), Some(policy), Some(token)) = (working_directory, environment, cancellation)
+    {
+        return crate::run_in_with_environment_and_cancellation(
+            "cargo", args, timeout, path, policy, token,
+        );
+    }
     match (working_directory, environment) {
         (Some(path), Some(policy)) => {
             crate::run_in_with_environment("cargo", args, timeout, path, policy)
@@ -192,15 +237,17 @@ fn apply(builder: &mut GateRunBuilder, check: Check, completed: Completed, origi
             // The row that matters. A tool that could not run has not passed,
             // and reporting that as a clippy failure would send a user hunting
             // for a lint that does not exist.
-            builder.untrustworthy(
+            builder.untrustworthy(if completed.status == crate::Outcome::Cancelled {
+                rulebound_orchestrate::UntrustworthyReason::Cancelled
+            } else {
                 rulebound_orchestrate::UntrustworthyReason::ToolCouldNotRun {
                     detail: format!(
                         "cargo {}: {}",
                         check.as_str(),
                         Interpretation::NoTrustworthyResult.describe(completed.status)
                     ),
-                },
-            );
+                }
+            });
         }
         Interpretation::Failed => {
             let diagnostics = first_diagnostics(&completed, 5);

@@ -56,7 +56,7 @@ pub fn run_tool(
     origin: Origin,
 ) -> rulebound_orchestrate::GateRun {
     run_tool_at(
-        gate_id, program, args, format, values, timeout, origin, None, None,
+        gate_id, program, args, format, values, timeout, origin, None, None, None,
     )
 }
 
@@ -86,6 +86,7 @@ pub fn run_tool_in(
         timeout,
         origin,
         Some(working_directory),
+        None,
         None,
     )
 }
@@ -119,6 +120,35 @@ pub fn run_tool_in_with_environment(
         origin,
         Some(working_directory),
         Some(environment),
+        None,
+    )
+}
+
+/// Run an external tool with cooperative cancellation in a supplied root.
+#[allow(clippy::too_many_arguments)]
+pub fn run_tool_in_with_environment_and_cancellation(
+    gate_id: &GateId,
+    program: &str,
+    args: &[String],
+    format: OutputFormat,
+    values: &TemplateValues,
+    timeout: Duration,
+    origin: Origin,
+    working_directory: &Path,
+    environment: &EnvironmentPolicy,
+    cancellation: &crate::CancellationToken,
+) -> rulebound_orchestrate::GateRun {
+    run_tool_at(
+        gate_id,
+        program,
+        args,
+        format,
+        values,
+        timeout,
+        origin,
+        Some(working_directory),
+        Some(environment),
+        Some(cancellation),
     )
 }
 
@@ -133,6 +163,7 @@ fn run_tool_at(
     origin: Origin,
     working_directory: Option<&Path>,
     environment: Option<&EnvironmentPolicy>,
+    cancellation: Option<&crate::CancellationToken>,
 ) -> rulebound_orchestrate::GateRun {
     let mut builder = GateRunBuilder::new();
 
@@ -144,25 +175,37 @@ fn run_tool_at(
         }
     };
 
-    let completed = match (working_directory, environment) {
-        (Some(path), Some(policy)) => {
-            crate::run_in_with_environment(program, &argv, timeout, path, policy)
+    let completed = if let (Some(path), Some(policy), Some(token)) =
+        (working_directory, environment, cancellation)
+    {
+        crate::run_in_with_environment_and_cancellation(
+            program, &argv, timeout, path, policy, token,
+        )
+    } else {
+        match (working_directory, environment) {
+            (Some(path), Some(policy)) => {
+                crate::run_in_with_environment(program, &argv, timeout, path, policy)
+            }
+            (Some(path), None) => crate::run_in(program, &argv, timeout, path),
+            (None, Some(policy)) => crate::run_with_environment(program, &argv, timeout, policy),
+            (None, None) => run(program, &argv, timeout),
         }
-        (Some(path), None) => crate::run_in(program, &argv, timeout, path),
-        (None, Some(policy)) => crate::run_with_environment(program, &argv, timeout, policy),
-        (None, None) => run(program, &argv, timeout),
     };
     match completed
         .status
         .interpretation_with(crate::cargo_exit_codes())
     {
         Interpretation::NoTrustworthyResult => {
-            builder.untrustworthy(UntrustworthyReason::ToolCouldNotRun {
-                detail: format!(
-                    "{program}: {}",
-                    Interpretation::NoTrustworthyResult.describe(completed.status)
-                ),
-            });
+            if completed.status == crate::Outcome::Cancelled {
+                builder.untrustworthy(UntrustworthyReason::Cancelled);
+            } else {
+                builder.untrustworthy(UntrustworthyReason::ToolCouldNotRun {
+                    detail: format!(
+                        "{program}: {}",
+                        Interpretation::NoTrustworthyResult.describe(completed.status)
+                    ),
+                });
+            }
             return finish(builder, gate_id, origin);
         }
         // **Exit 0 does not mean "no findings".**

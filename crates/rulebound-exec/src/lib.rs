@@ -34,6 +34,8 @@ use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use rulebound_orchestrate::{Origin, ToolId, UntrustworthyReason};
@@ -65,6 +67,22 @@ pub struct Completed {
     pub stdout: String,
     /// Whatever it wrote to stderr, which is usually where diagnostics land.
     pub stderr: String,
+}
+
+/// Cooperative cancellation shared by callers and running child processes.
+#[derive(Debug, Clone, Default)]
+pub struct CancellationToken(Arc<AtomicBool>);
+
+impl CancellationToken {
+    /// Request cancellation.
+    pub fn cancel(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+
+    /// Whether cancellation has been requested.
+    pub fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
 }
 
 /// Explicit environment inheritance and overrides for a child process.
@@ -181,6 +199,8 @@ pub enum Outcome {
     TimedOut,
     /// The process could not be started at all.
     SpawnFailed,
+    /// The caller cancelled the process and it was terminated.
+    Cancelled,
 }
 
 impl Outcome {
@@ -218,7 +238,7 @@ impl Outcome {
                     Interpretation::NoTrustworthyResult
                 }
             }
-            Self::Signalled(_) | Self::TimedOut | Self::SpawnFailed => {
+            Self::Signalled(_) | Self::TimedOut | Self::SpawnFailed | Self::Cancelled => {
                 Interpretation::NoTrustworthyResult
             }
         }
@@ -297,6 +317,9 @@ impl Interpretation {
             (Self::NoTrustworthyResult, Outcome::SpawnFailed) => {
                 "tool could not be started; it is not installed or not executable".to_string()
             }
+            (Self::NoTrustworthyResult, Outcome::Cancelled) => {
+                "tool was cancelled by the caller".to_string()
+            }
         }
     }
 }
@@ -350,6 +373,25 @@ pub fn run_in_with_environment(
     )
 }
 
+/// Run a child with explicit root, environment, and cooperative cancellation.
+pub fn run_in_with_environment_and_cancellation(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    working_directory: &Path,
+    environment: &EnvironmentPolicy,
+    cancellation: &CancellationToken,
+) -> Completed {
+    run_at_with_environment_and_cancellation(
+        program,
+        args,
+        timeout,
+        Some(working_directory),
+        Some(environment),
+        Some(cancellation),
+    )
+}
+
 /// Run a program with an explicit environment policy and inherited working
 /// directory.
 ///
@@ -381,6 +423,31 @@ fn run_at_with_environment(
     working_directory: Option<&Path>,
     environment: Option<&EnvironmentPolicy>,
 ) -> Completed {
+    run_at_with_environment_and_cancellation(
+        program,
+        args,
+        timeout,
+        working_directory,
+        environment,
+        None,
+    )
+}
+
+fn run_at_with_environment_and_cancellation(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    working_directory: Option<&Path>,
+    environment: Option<&EnvironmentPolicy>,
+    cancellation: Option<&CancellationToken>,
+) -> Completed {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        return Completed {
+            status: Outcome::Cancelled,
+            stdout: String::new(),
+            stderr: String::new(),
+        };
+    }
     let mut command = Command::new(program);
     command
         .args(args)
@@ -439,6 +506,11 @@ fn run_at_with_environment(
 
     let deadline = Instant::now() + timeout;
     let outcome = loop {
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            let _ = child.kill();
+            let _ = child.wait();
+            break Outcome::Cancelled;
+        }
         match child.try_wait() {
             Ok(Some(s)) => {
                 let outcome = if s.success() {

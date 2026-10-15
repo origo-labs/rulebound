@@ -6,8 +6,6 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use std::{error::Error, fmt};
 
@@ -17,21 +15,7 @@ use rulebound_observe::snapshot::{Snapshot, SnapshotError, SnapshotIdentity};
 use rulebound_observe::{Budget, Observation, SnapshotObservationError};
 use rulebound_orchestrate::{GateRun, ReductionInput, Verdict, reduce};
 
-/// Cooperative cancellation signal for embedded providers.
-#[derive(Debug, Clone, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
-
-impl CancellationToken {
-    /// Request cancellation from the provider.
-    pub fn cancel(&self) {
-        self.0.store(true, Ordering::Release);
-    }
-
-    /// Whether cancellation has been requested.
-    pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::Acquire)
-    }
-}
+pub use rulebound_exec::CancellationToken;
 
 /// Resource bounds passed to each embedded provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -495,11 +479,12 @@ pub fn evaluate_with_providers(
             })
         {
             let (run, provided_inventory) =
-                rulebound_exec::checks_green::run_checks_in_with_environment(
+                rulebound_exec::checks_green::run_checks_in_with_environment_and_cancellation(
                     rulebound_exec::origin("cargo", &options.cargo_version),
                     timeout(gate),
                     &options.execution_root,
                     &options.environment,
+                    &options.cancellation,
                 );
             runs.push(run);
             inventory = Some(provided_inventory);
@@ -692,11 +677,12 @@ fn run_gate(
 
     match gate.primitive {
         Primitive::ChecksGreen => {
-            rulebound_exec::checks_green::run_checks_in_with_environment(
+            rulebound_exec::checks_green::run_checks_in_with_environment_and_cancellation(
                 rulebound_exec::origin("cargo", &options.cargo_version),
                 timeout(gate),
                 &options.execution_root,
                 &options.environment,
+                &options.cancellation,
             )
             .0
         }
@@ -727,7 +713,7 @@ fn run_gate(
                     .find_map(|arg| arg.strip_prefix("--index=").map(str::to_string))
                     .unwrap_or_default(),
             };
-            rulebound_exec::external_tool::run_tool_in_with_environment(
+            rulebound_exec::external_tool::run_tool_in_with_environment_and_cancellation(
                 &gate.id,
                 tool,
                 &gate.args,
@@ -737,6 +723,7 @@ fn run_gate(
                 rulebound_exec::origin(tool, &options.external_tool_version),
                 &options.execution_root,
                 &options.environment,
+                &options.cancellation,
             )
         }
         Primitive::Embedded => {
