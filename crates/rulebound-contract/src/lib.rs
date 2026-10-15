@@ -124,9 +124,9 @@ impl fmt::Display for GateId {
 ///
 /// The split matters and is enforced by the crate boundary (PLAN.md 2):
 /// `Analyzed` primitives are pure functions of an `Observation`; `Delegated`
-/// primitives are constructed only by `rulebound-exec` and carry a tool's
-/// verdict plus its evidence. `Judged` is v1-unimplemented by decision
-/// (PLAN.md 1.1) and its `NotImplemented` outcome forces `error`, not `pass`.
+/// primitives carry an external process verdict; `Embedded` primitives call a
+/// registered Rust provider. `Judged` is v1-unimplemented by decision (PLAN.md
+/// 1.1) and its `NotImplemented` outcome forces `error`, not `pass`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Primitive {
     // ---- Analyzed: no I/O, pure over an Observation --------------------
@@ -150,6 +150,8 @@ pub enum Primitive {
     ChecksGreen,
     /// Did a third-party gate pass? argv, exit code, SARIF findings.
     ExternalTool,
+    /// Run a registered Rust analyzer inside the caller process.
+    Embedded,
 
     // ---- Judged: escalate-only, unimplemented in v1 --------------------
     /// Residual judgement. Opt-in, escalate-only, `NotImplemented` in v1.
@@ -175,18 +177,19 @@ impl Primitive {
             Self::SecretAbsent => "secret_absent",
             Self::ChecksGreen => "checks_green",
             Self::ExternalTool => "external_tool",
+            Self::Embedded => "embedded",
             Self::Judged => "judged",
             Self::ContractNotLoosened => "contract_not_loosened",
             Self::ContractReviewStale => "contract_review_stale",
         }
     }
 
-    /// Which gate kind this primitive belongs to (PLAN.md 3.0).
     /// Which gate kind this primitive belongs to, and therefore which crate
     /// is allowed to implement it.
     pub const fn kind(self) -> PrimitiveKind {
         match self {
             Self::ChecksGreen | Self::ExternalTool => PrimitiveKind::Delegated,
+            Self::Embedded => PrimitiveKind::EmbeddedProvider,
             Self::Judged => PrimitiveKind::Judged,
             _ => PrimitiveKind::Analyzed,
         }
@@ -211,6 +214,8 @@ pub enum PrimitiveKind {
     Delegated,
     /// Escalate-only and unimplemented in v1.
     Judged,
+    /// A registered Rust implementation invoked inside the service process.
+    EmbeddedProvider,
 }
 
 /// A suppression record (PLAN.md M4, and `slop-gate` decision 3): gate,
@@ -282,6 +287,10 @@ pub struct Gate {
     pub args: Vec<String>,
     /// What the tool writes on stdout.
     pub format: Option<String>,
+    /// Opaque registration key for an `embedded` provider.
+    pub provider: Option<String>,
+    /// Candidate-relative provider policy file.
+    pub policy_path: Option<String>,
     /// The published measurement that justifies this gate's severity.
     ///
     /// Required to *promote* a gate to `error` in a diff; a gate written as
@@ -320,6 +329,8 @@ impl Gate {
             tool: None,
             args: Vec::new(),
             format: None,
+            provider: None,
+            policy_path: None,
             timeout_seconds: None,
             calibration: None,
         }
@@ -330,10 +341,11 @@ impl Gate {
 /// gate registry all agree. The registry matches on it exhaustively, so
 /// adding a variant here is a compile error until somebody decides what it
 /// does — which is the intended friction.
-pub const ALL_PRIMITIVES: [Primitive; 12] = [
+pub const ALL_PRIMITIVES: [Primitive; 13] = [
     Primitive::ChecksGreen,
     Primitive::DependencySurfaceUnchanged,
     Primitive::ExternalTool,
+    Primitive::Embedded,
     Primitive::Judged,
     Primitive::PathsUnchanged,
     Primitive::PublicApiUnchanged,

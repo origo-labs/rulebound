@@ -302,6 +302,16 @@ fn origin_json(origin: &Origin) -> serde_json::Value {
             "tool": tool.as_str(),
             "version": version,
         }),
+        Origin::Embedded {
+            provider,
+            version,
+            analyzer_fingerprint,
+        } => serde_json::json!({
+            "kind": "embedded",
+            "provider": provider,
+            "version": version,
+            "analyzerFingerprint": analyzer_fingerprint,
+        }),
     }
 }
 

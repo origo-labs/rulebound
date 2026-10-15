@@ -214,6 +214,12 @@ struct RawGate {
     /// What the tool writes on stdout: `sarif` or `lines`.
     #[serde(default)]
     format: Option<String>,
+    /// Required registration key for `embedded` checks.
+    #[serde(default)]
+    provider: Option<String>,
+    /// Candidate-relative configuration input for `embedded` checks.
+    #[serde(default)]
+    policy_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -435,6 +441,30 @@ impl RawGate {
             )));
         }
 
+        if primitive == Primitive::Embedded {
+            let Some(provider) = self.provider.as_deref() else {
+                return Err(ContractError::Validation(format!(
+                    "gate `{id}` is `embedded` but declares no `provider`"
+                )));
+            };
+            if !valid_provider_id(provider) {
+                return Err(ContractError::Validation(format!(
+                    "gate `{id}` declares invalid provider identifier `{provider}`"
+                )));
+            }
+            if let Some(path) = self.policy_path.as_deref() {
+                if !valid_relative_path(path) {
+                    return Err(ContractError::Validation(format!(
+                        "gate `{id}` declares invalid repository-relative `policy_path` `{path}`"
+                    )));
+                }
+            }
+        } else if self.provider.is_some() || self.policy_path.is_some() {
+            return Err(ContractError::Validation(format!(
+                "gate `{id}` declares `provider`/`policy_path`, which only `embedded` uses"
+            )));
+        }
+
         Ok(Gate {
             id,
             primitive,
@@ -447,6 +477,8 @@ impl RawGate {
             tool: self.tool.clone(),
             args: self.args.clone(),
             format: self.format.clone(),
+            provider: self.provider.clone(),
+            policy_path: self.policy_path.clone(),
             timeout_seconds: self.timeout_seconds,
             calibration: self.calibration.clone(),
         })
@@ -463,6 +495,30 @@ fn parse_severity(s: &str) -> Option<Severity> {
         "escalate" => Some(Severity::Escalate),
         _ => None,
     }
+}
+
+fn valid_provider_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '.'))
+        && value
+            .chars()
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphanumeric())
+}
+
+fn valid_relative_path(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.contains('\\')
+        && !(bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':')
+        && !value
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+        && !value.contains('\0')
 }
 
 fn parse_primitive(s: &str) -> Option<Primitive> {

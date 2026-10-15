@@ -181,7 +181,9 @@ fn run_tool_at(
         Interpretation::Passed | Interpretation::Failed => {
             let (tool_id, version) = match &origin {
                 Origin::Delegated { tool, version } => (tool.clone(), version.clone()),
-                Origin::Analyzed { .. } => (ToolId::new("external"), String::new()),
+                Origin::Analyzed { .. } | Origin::Embedded { .. } => {
+                    (ToolId::new("external"), String::new())
+                }
             };
             let findings = match format.parse(&completed, &tool_id, &version) {
                 Ok(f) => f,
@@ -464,6 +466,7 @@ fn origin_label(origin: &Origin) -> String {
     match origin {
         Origin::Delegated { tool, .. } => format!("external tool `{tool}`"),
         Origin::Analyzed { primitive } => format!("gate `{primitive}`"),
+        Origin::Embedded { provider, .. } => format!("embedded provider `{provider}`"),
     }
 }
 

@@ -461,6 +461,21 @@ fn run_gate(
                 &options.environment,
             )
         }
+        Primitive::Embedded => {
+            let provider = gate.provider.as_deref().unwrap_or("<missing>");
+            GateRun::untrustworthy(
+                gate.id.clone(),
+                gate.primitive,
+                rulebound_orchestrate::UntrustworthyReason::ProviderUnavailable {
+                    provider: provider.to_string(),
+                },
+                rulebound_orchestrate::Origin::Embedded {
+                    provider: provider.to_string(),
+                    version: String::new(),
+                    analyzer_fingerprint: String::new(),
+                },
+            )
+        }
         primitive => {
             let result = registry::dispatch(
                 primitive,

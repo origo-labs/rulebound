@@ -19,10 +19,10 @@ use rulebound_contract::{Contract, GateId, Primitive, Severity};
 
 /// Who produced a verdict.
 ///
-/// `Delegated` is constructible only by `rulebound-exec`, and `Judged` is not
-/// in this enum at all: a judgement can only ever be a `Fail` at escalate
-/// severity, so "a model said this is fine" is not expressible as a pass. That
-/// is the type system, not a convention.
+/// `Delegated` identifies a process provider and `Embedded` identifies a
+/// registered Rust analyzer. `Judged` is not in this enum: a judgement can
+/// only ever be a `Fail` at escalate severity, so "a model said this is fine"
+/// is not expressible as a pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Origin {
     /// Rulebound's own AST or diff analysis.
@@ -37,6 +37,15 @@ pub enum Origin {
         /// The tool version, so a finding is reproducible against a known
         /// implementation.
         version: String,
+    },
+    /// A registered Rust analyzer running inside Rulebound.
+    Embedded {
+        /// The registration identifier from the contract.
+        provider: String,
+        /// Provider implementation version.
+        version: String,
+        /// Fingerprint identifying the analyzer implementation.
+        analyzer_fingerprint: String,
     },
 }
 
@@ -84,6 +93,11 @@ pub enum UntrustworthyReason {
         /// What happened, in one sentence.
         detail: String,
     },
+    /// A gate declared a provider that was not registered for this run.
+    ProviderUnavailable {
+        /// The provider identifier from the contract.
+        provider: String,
+    },
     /// A gate could not decide, e.g. a file it needed to parse did not parse.
     Indeterminate {
         /// What prevented a decision.
@@ -111,6 +125,7 @@ impl UntrustworthyReason {
             Self::ToolCouldNotRun { detail }
             | Self::Indeterminate { detail }
             | Self::ContractInvalid { detail } => detail,
+            Self::ProviderUnavailable { provider } => provider,
             Self::Unimplemented { primitive } => primitive.as_str(),
         }
     }

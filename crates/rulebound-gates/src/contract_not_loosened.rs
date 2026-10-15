@@ -299,6 +299,28 @@ fn compare(
         ));
     }
 
+    if base.provider != head.provider {
+        out.push(loosened(
+            ctx,
+            id,
+            base.provider.as_deref().unwrap_or("<none>"),
+            head.provider.as_deref().unwrap_or("<none>"),
+            justified,
+            &format!("gate `{id}` changed its embedded provider identity"),
+        ));
+    }
+
+    if base.policy_path != head.policy_path {
+        out.push(loosened(
+            ctx,
+            id,
+            base.policy_path.as_deref().unwrap_or("<none>"),
+            head.policy_path.as_deref().unwrap_or("<none>"),
+            justified,
+            &format!("gate `{id}` changed its embedded provider policy path"),
+        ));
+    }
+
     // Frozen paths narrowed.
     let narrowed: Vec<&String> = base
         .paths
