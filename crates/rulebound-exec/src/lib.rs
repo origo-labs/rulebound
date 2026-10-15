@@ -107,6 +107,13 @@ impl std::fmt::Debug for EnvironmentPolicy {
 }
 
 impl EnvironmentPolicy {
+    fn inherited_names(&self) -> Vec<String> {
+        self.inherited
+            .iter()
+            .map(|name| name.to_string_lossy().into_owned())
+            .collect()
+    }
+
     /// Inherit the complete parent environment.
     pub fn inherit_all() -> Self {
         Self {
@@ -141,7 +148,7 @@ impl EnvironmentPolicy {
 
     /// Names of variables permitted or explicitly set, without their values.
     pub fn allowed_names(&self) -> Vec<String> {
-        let mut names = if self.inherit_all {
+        let mut names: Vec<String> = if self.inherit_all {
             std::env::vars_os()
                 .map(|(name, _)| name.to_string_lossy().into_owned())
                 .collect()

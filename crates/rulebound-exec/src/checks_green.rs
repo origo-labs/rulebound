@@ -19,7 +19,7 @@ use std::time::Duration;
 use rulebound_orchestrate::{Finding, GateRunBuilder, Origin, Side, Subject, SubjectKind};
 
 use crate::EnvironmentPolicy;
-use crate::{Completed, Interpretation, run};
+use crate::{Completed, Interpretation};
 
 /// One of the three checks, and what its name is in a finding.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

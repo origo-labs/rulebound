@@ -6,6 +6,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{error::Error, fmt};
 
@@ -223,7 +224,7 @@ fn valid_provider_id(id: &str) -> bool {
 }
 
 /// Inputs that the caller supplies to make an evaluation reproducible.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct EvaluationOptions {
     /// Root directory in which all process checks run.
     pub execution_root: PathBuf,

@@ -12,6 +12,7 @@ workspace = true
 
 [dependencies]
 blake3 = { workspace = true }
+camino = { workspace = true }
 rulebound-contract = { workspace = true }
 rulebound-observe = { workspace = true }
 rulebound-gates = { workspace = true }

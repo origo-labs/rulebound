@@ -186,6 +186,9 @@ pub enum SkipReason {
 /// construction: a gate that cannot produce a trustworthy verdict has to say
 /// which of the non-pass variants it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
+// Findings are evidence values kept inline for simple exhaustive matching;
+// boxing them would change this public outcome API.
+#[allow(clippy::large_enum_variant)]
 pub enum GateOutcome {
     /// The gate ran and found nothing it reports. Compatible with accept.
     Pass {
