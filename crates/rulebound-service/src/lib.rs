@@ -272,6 +272,17 @@ pub struct Evaluation {
     pub trust_failures: Vec<EvaluationTrustFailure>,
     /// Allowed environment variable names observed for this evaluation.
     pub allowed_environment_names: Vec<String>,
+    /// Identities of caller-declared ignored execution inputs.
+    pub ignored_execution_inputs: Vec<IgnoredExecutionInput>,
+}
+
+/// Content identity for a caller-declared ignored execution input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredExecutionInput {
+    /// Repository-relative input path.
+    pub path: String,
+    /// Digest of the path and all entries beneath it.
+    pub digest: String,
 }
 
 /// Digest and mode evidence for one changed observation path.
@@ -298,6 +309,15 @@ pub enum EvaluationTrustFailure {
         expected: SnapshotIdentity,
         /// Identity observed after checks completed.
         actual: SnapshotIdentity,
+    },
+    /// A caller-declared ignored execution input changed during checks.
+    IgnoredExecutionInputMutated {
+        /// Path declared by the caller.
+        path: String,
+        /// Identity captured before checks.
+        expected: String,
+        /// Identity observed after checks.
+        actual: String,
     },
     /// The execution root could not be read after checks completed.
     ExecutionRootUnavailable(SnapshotError),
@@ -366,6 +386,7 @@ pub struct SnapshotEvaluationRequest<'a> {
     observation_budget: Budget,
     expect_change: bool,
     ignored_execution_paths: Vec<String>,
+    ignored_execution_inputs: Vec<String>,
     providers: &'a ProviderRegistry,
 }
 
@@ -389,6 +410,7 @@ impl<'a> SnapshotEvaluationRequest<'a> {
             observation_budget: None,
             expect_change: false,
             ignored_execution_paths: Vec::new(),
+            ignored_execution_inputs: Vec::new(),
         }
     }
 }
@@ -405,6 +427,7 @@ pub struct SnapshotEvaluationRequestBuilder<'a> {
     observation_budget: Option<Budget>,
     expect_change: bool,
     ignored_execution_paths: Vec<String>,
+    ignored_execution_inputs: Vec<String>,
 }
 
 impl<'a> SnapshotEvaluationRequestBuilder<'a> {
@@ -423,6 +446,12 @@ impl<'a> SnapshotEvaluationRequestBuilder<'a> {
     /// Declare ignored output paths within the execution root.
     pub fn ignored_execution_paths(mut self, paths: impl IntoIterator<Item = String>) -> Self {
         self.ignored_execution_paths = paths.into_iter().collect();
+        self
+    }
+
+    /// Declare ignored fixture inputs whose identities must remain stable.
+    pub fn ignored_execution_inputs(mut self, paths: impl IntoIterator<Item = String>) -> Self {
+        self.ignored_execution_inputs = paths.into_iter().collect();
         self
     }
 
@@ -445,6 +474,7 @@ impl<'a> SnapshotEvaluationRequestBuilder<'a> {
             observation_budget,
             expect_change: self.expect_change,
             ignored_execution_paths: self.ignored_execution_paths,
+            ignored_execution_inputs: self.ignored_execution_inputs,
         })
     }
 }
@@ -555,6 +585,7 @@ pub fn evaluate_with_providers(
         contract_fingerprint: None,
         trust_failures: Vec::new(),
         allowed_environment_names: options.environment.allowed_names(),
+        ignored_execution_inputs: Vec::new(),
     }
 }
 
@@ -616,17 +647,21 @@ pub fn evaluate_snapshots(
         return Err(EvaluationError::CandidateContractMismatch);
     }
 
-    let actual = Snapshot::from_directory(
-        &request.options.execution_root,
-        &request.ignored_execution_paths,
-    )
-    .map_err(EvaluationError::Snapshot)?;
+    let mut ignored_for_identity = request.ignored_execution_paths.clone();
+    ignored_for_identity.extend(request.ignored_execution_inputs.iter().cloned());
+    ignored_for_identity.sort();
+    ignored_for_identity.dedup();
+    let actual = Snapshot::from_directory(&request.options.execution_root, &ignored_for_identity)
+        .map_err(EvaluationError::Snapshot)?;
     if actual.identity() != request.candidate.identity() {
         return Err(EvaluationError::ExecutionRootMismatch {
             expected: request.candidate.identity().clone(),
             actual: actual.identity().clone(),
         });
     }
+    let full_before = Snapshot::from_directory(&request.options.execution_root, &[])
+        .map_err(EvaluationError::Snapshot)?;
+    let ignored_before = ignored_input_evidence(&full_before, &request.ignored_execution_inputs);
 
     let observation = Observation::from_snapshots(
         request.baseline,
@@ -646,10 +681,8 @@ pub fn evaluate_snapshots(
     );
     evaluation.contract_fingerprint =
         Some(blake3::hash(request.contract_bytes).to_hex().to_string());
-    match Snapshot::from_directory(
-        &request.options.execution_root,
-        &request.ignored_execution_paths,
-    ) {
+    evaluation.ignored_execution_inputs = ignored_before.clone();
+    match Snapshot::from_directory(&request.options.execution_root, &ignored_for_identity) {
         Ok(after) if after.identity() != request.candidate.identity() => {
             evaluation
                 .trust_failures
@@ -659,7 +692,32 @@ pub fn evaluate_snapshots(
                 });
             evaluation.verdict = Verdict::Error;
         }
-        Ok(_) => {}
+        Ok(_) => {
+            let full_after = Snapshot::from_directory(&request.options.execution_root, &[]);
+            let Ok(full_after) = full_after else {
+                evaluation
+                    .trust_failures
+                    .push(EvaluationTrustFailure::ExecutionRootUnavailable(
+                        full_after.unwrap_err(),
+                    ));
+                evaluation.verdict = Verdict::Error;
+                return Ok(evaluation);
+            };
+            let ignored_after =
+                ignored_input_evidence(&full_after, &request.ignored_execution_inputs);
+            for (before, after) in ignored_before.iter().zip(ignored_after.iter()) {
+                if before.digest != after.digest {
+                    evaluation.trust_failures.push(
+                        EvaluationTrustFailure::IgnoredExecutionInputMutated {
+                            path: before.path.clone(),
+                            expected: before.digest.clone(),
+                            actual: after.digest.clone(),
+                        },
+                    );
+                    evaluation.verdict = Verdict::Error;
+                }
+            }
+        }
         Err(error) => {
             evaluation
                 .trust_failures
@@ -668,6 +726,29 @@ pub fn evaluate_snapshots(
         }
     }
     Ok(evaluation)
+}
+
+fn ignored_input_evidence(snapshot: &Snapshot, paths: &[String]) -> Vec<IgnoredExecutionInput> {
+    paths
+        .iter()
+        .map(|path| {
+            let mut hasher = blake3::Hasher::new();
+            hasher.update(b"rulebound-ignored-input-v1\0");
+            for entry in snapshot.entries().filter(|entry| {
+                entry.path() == path || entry.path().starts_with(&format!("{path}/"))
+            }) {
+                hasher.update(&(entry.path().len() as u64).to_be_bytes());
+                hasher.update(entry.path().as_bytes());
+                hasher.update(&entry.mode().to_be_bytes());
+                hasher.update(&(entry.content().len() as u64).to_be_bytes());
+                hasher.update(entry.content());
+            }
+            IgnoredExecutionInput {
+                path: path.clone(),
+                digest: hasher.finalize().to_hex().to_string(),
+            }
+        })
+        .collect()
 }
 
 fn observation_fingerprint(observation: &Observation) -> Option<String> {

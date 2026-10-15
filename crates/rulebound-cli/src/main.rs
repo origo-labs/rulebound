@@ -224,6 +224,14 @@ fn run(cli: Cli) -> Result<Verdict, String> {
                 candidate_mode: file.candidate_mode,
             })
             .collect(),
+        ignored_execution_inputs: evaluation
+            .ignored_execution_inputs
+            .iter()
+            .map(|input| rulebound_report::IgnoredInputEvidence {
+                path: input.path.clone(),
+                digest: input.digest.clone(),
+            })
+            .collect(),
         rendered_diff: evaluation.rendered_diff.clone(),
         rendered_diff_truncated: evaluation.rendered_diff_truncated,
         evaluated_at_unix: evaluation_now,

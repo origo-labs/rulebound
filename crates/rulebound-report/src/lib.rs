@@ -45,6 +45,8 @@ pub struct ReportContext {
     pub contract_fingerprint: Option<String>,
     /// Changed paths and their full-content identity evidence.
     pub changed_files: Vec<FileEvidence>,
+    /// Identities of caller-declared ignored execution inputs.
+    pub ignored_execution_inputs: Vec<IgnoredInputEvidence>,
     /// Bounded, human-readable observation diff.
     pub rendered_diff: String,
     /// Whether the observation diff was clipped.
@@ -74,6 +76,15 @@ pub struct FileEvidence {
     pub baseline_mode: Option<u32>,
     /// Candidate snapshot mode, when available.
     pub candidate_mode: Option<u32>,
+}
+
+/// Identity evidence for an ignored execution input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IgnoredInputEvidence {
+    /// Repository-relative input path.
+    pub path: String,
+    /// Digest of the path and all entries beneath it.
+    pub digest: String,
 }
 
 /// The three targets, as top-level JSON keys.
@@ -477,6 +488,10 @@ fn context_json(context: &ReportContext, runs: &[GateRun], version: &str) -> ser
             "candidateDigest": file.candidate_digest,
             "baselineMode": file.baseline_mode,
             "candidateMode": file.candidate_mode,
+        })).collect::<Vec<_>>(),
+        "ignoredExecutionInputs": context.ignored_execution_inputs.iter().map(|input| serde_json::json!({
+            "path": input.path,
+            "digest": input.digest,
         })).collect::<Vec<_>>(),
         "diff": {
             "text": context.rendered_diff,
