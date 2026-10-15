@@ -181,6 +181,7 @@ fn run(cli: Cli) -> Result<Verdict, String> {
         &obs,
         &EvaluationOptions {
             execution_root: repo.root().as_std_path().to_path_buf(),
+            environment: rulebound_exec::EnvironmentPolicy::inherit_all(),
             baseline: base,
             candidate: "HEAD".to_string(),
             now_unix: unix_now(),

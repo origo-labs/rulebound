@@ -18,6 +18,7 @@ use std::time::Duration;
 
 use rulebound_orchestrate::{Finding, GateRunBuilder, Origin, Side, Subject, SubjectKind};
 
+use crate::EnvironmentPolicy;
 use crate::{Completed, Interpretation, run};
 
 /// One of the three checks, and what its name is in a finding.
@@ -69,7 +70,7 @@ pub fn run_checks(
     rulebound_orchestrate::GateRun,
     crate::test_inventory::TestInventory,
 ) {
-    run_checks_at(origin, timeout, None)
+    run_checks_at(origin, timeout, None, None)
 }
 
 /// Run the built-in Cargo checks in a supplied project root.
@@ -85,13 +86,32 @@ pub fn run_checks_in(
     rulebound_orchestrate::GateRun,
     crate::test_inventory::TestInventory,
 ) {
-    run_checks_at(origin, timeout, Some(working_directory))
+    run_checks_at(origin, timeout, Some(working_directory), None)
+}
+
+/// Run the built-in Cargo checks with explicit working directory and
+/// environment policy.
+///
+/// # Errors
+///
+/// Process startup and check failures remain typed in the returned gate run.
+pub fn run_checks_in_with_environment(
+    origin: Origin,
+    timeout: Duration,
+    working_directory: &Path,
+    environment: &EnvironmentPolicy,
+) -> (
+    rulebound_orchestrate::GateRun,
+    crate::test_inventory::TestInventory,
+) {
+    run_checks_at(origin, timeout, Some(working_directory), Some(environment))
 }
 
 fn run_checks_at(
     origin: Origin,
     timeout: Duration,
     working_directory: Option<&Path>,
+    environment: Option<&EnvironmentPolicy>,
 ) -> (
     rulebound_orchestrate::GateRun,
     crate::test_inventory::TestInventory,
@@ -101,7 +121,7 @@ fn run_checks_at(
         apply(
             &mut builder,
             check,
-            run_cargo(&check.argv(), timeout, working_directory),
+            run_cargo(&check.argv(), timeout, working_directory, environment),
             &origin,
         );
     }
@@ -110,7 +130,7 @@ fn run_checks_at(
         rulebound_contract::Primitive::ChecksGreen,
         origin,
     );
-    (run, list_tests(timeout, working_directory))
+    (run, list_tests(timeout, working_directory, environment))
 }
 
 /// The test inventory: `cargo test -- --list`.
@@ -123,11 +143,13 @@ fn run_checks_at(
 fn list_tests(
     timeout: Duration,
     working_directory: Option<&Path>,
+    environment: Option<&EnvironmentPolicy>,
 ) -> crate::test_inventory::TestInventory {
     let completed = run_cargo(
         &["test".to_string(), "--".to_string(), "--list".to_string()],
         timeout,
         working_directory,
+        environment,
     );
     // An inventory we could not read is an empty one, and the consuming gate
     // has to be able to tell that from a build with no tests. `checks_green`
@@ -143,10 +165,19 @@ fn list_tests(
     crate::test_inventory::TestInventory::parse(&completed.stdout).0
 }
 
-fn run_cargo(args: &[String], timeout: Duration, working_directory: Option<&Path>) -> Completed {
-    match working_directory {
-        Some(path) => crate::run_in("cargo", args, timeout, path),
-        None => crate::run("cargo", args, timeout),
+fn run_cargo(
+    args: &[String],
+    timeout: Duration,
+    working_directory: Option<&Path>,
+    environment: Option<&EnvironmentPolicy>,
+) -> Completed {
+    match (working_directory, environment) {
+        (Some(path), Some(policy)) => {
+            crate::run_in_with_environment("cargo", args, timeout, path, policy)
+        }
+        (Some(path), None) => crate::run_in("cargo", args, timeout, path),
+        (None, Some(policy)) => crate::run_with_environment("cargo", args, timeout, policy),
+        (None, None) => crate::run("cargo", args, timeout),
     }
 }
 

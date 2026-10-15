@@ -29,6 +29,8 @@ pub mod checks_green;
 pub mod external_tool;
 pub mod test_inventory;
 
+use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::io::Read;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -63,6 +65,102 @@ pub struct Completed {
     pub stdout: String,
     /// Whatever it wrote to stderr, which is usually where diagnostics land.
     pub stderr: String,
+}
+
+/// Explicit environment inheritance and overrides for a child process.
+///
+/// The debug representation reports variable names only and never prints
+/// values, which may contain credentials.
+#[derive(Clone, PartialEq, Eq, Default)]
+pub struct EnvironmentPolicy {
+    inherit_all: bool,
+    inherited: std::collections::BTreeSet<OsString>,
+    overrides: BTreeMap<OsString, OsString>,
+}
+
+impl std::fmt::Debug for EnvironmentPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EnvironmentPolicy")
+            .field("inherit_all", &self.inherit_all)
+            .field("inherited_names", &self.inherited_names())
+            .field("override_names", &self.overrides.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl EnvironmentPolicy {
+    /// Inherit the complete parent environment.
+    pub fn inherit_all() -> Self {
+        Self {
+            inherit_all: true,
+            ..Self::default()
+        }
+    }
+
+    /// Start with an empty child environment and inherit only these names.
+    pub fn allowlist<I, S>(names: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<OsString>,
+    {
+        Self {
+            inherited: names.into_iter().map(Into::into).collect(),
+            ..Self::default()
+        }
+    }
+
+    /// Add one parent environment variable to the inherited allowlist.
+    pub fn inherit(mut self, name: impl Into<OsString>) -> Self {
+        self.inherited.insert(name.into());
+        self
+    }
+
+    /// Set a child variable explicitly.
+    pub fn set(mut self, name: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.overrides.insert(name.into(), value.into());
+        self
+    }
+
+    /// Names of variables permitted or explicitly set, without their values.
+    pub fn allowed_names(&self) -> Vec<String> {
+        let mut names = if self.inherit_all {
+            std::env::vars_os()
+                .map(|(name, _)| name.to_string_lossy().into_owned())
+                .collect()
+        } else {
+            self.inherited
+                .iter()
+                .map(|name| name.to_string_lossy().into_owned())
+                .collect()
+        };
+        names.extend(
+            self.overrides
+                .keys()
+                .map(|name| name.to_string_lossy().into_owned()),
+        );
+        names.extend(
+            ["CARGO_TERM_COLOR", "NO_COLOR", "CLICOLOR", "TERM", "SHELL"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    fn apply(&self, command: &mut Command) {
+        if !self.inherit_all {
+            command.env_clear();
+            for name in &self.inherited {
+                if let Some(value) = std::env::var_os(name) {
+                    command.env(name, value);
+                }
+            }
+        }
+        for (name, value) in &self.overrides {
+            command.env(name, value);
+        }
+    }
 }
 
 /// How a process finished, before any interpretation.
@@ -231,18 +329,68 @@ pub fn run_in(
     run_at(program, args, timeout, Some(working_directory))
 }
 
+/// Run a program in an explicit working directory and environment policy.
+///
+/// # Errors
+///
+/// Startup, timeout, and process failures are returned in [`Completed`].
+pub fn run_in_with_environment(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    working_directory: &Path,
+    environment: &EnvironmentPolicy,
+) -> Completed {
+    run_at_with_environment(
+        program,
+        args,
+        timeout,
+        Some(working_directory),
+        Some(environment),
+    )
+}
+
+/// Run a program with an explicit environment policy and inherited working
+/// directory.
+///
+/// # Errors
+///
+/// Startup, timeout, and process failures are returned in [`Completed`].
+pub fn run_with_environment(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    environment: &EnvironmentPolicy,
+) -> Completed {
+    run_at_with_environment(program, args, timeout, None, Some(environment))
+}
+
 fn run_at(
     program: &str,
     args: &[String],
     timeout: Duration,
     working_directory: Option<&Path>,
 ) -> Completed {
+    run_at_with_environment(program, args, timeout, working_directory, None)
+}
+
+fn run_at_with_environment(
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    working_directory: Option<&Path>,
+    environment: Option<&EnvironmentPolicy>,
+) -> Completed {
     let mut command = Command::new(program);
     command
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(policy) = environment {
+        policy.apply(&mut command);
+    }
+    command
         // A delegated tool's colour codes end up inside a finding's `observed`
         // field, and a JSON or SARIF artefact full of escape sequences is not
         // machine-readable. Colour is a function of the terminal, and a report

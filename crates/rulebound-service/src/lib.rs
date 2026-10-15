@@ -19,6 +19,8 @@ use rulebound_orchestrate::{GateRun, ReductionInput, Verdict, reduce};
 pub struct EvaluationOptions {
     /// Root directory in which all process checks run.
     pub execution_root: PathBuf,
+    /// Explicit policy for child process environment variables.
+    pub environment: rulebound_exec::EnvironmentPolicy,
     /// Resolved baseline commit identifier.
     pub baseline: String,
     /// Candidate reference used to expand external-tool arguments.
@@ -49,6 +51,8 @@ pub struct Evaluation {
     pub contract_fingerprint: Option<String>,
     /// Trust failures detected while evaluating supplied snapshots.
     pub trust_failures: Vec<EvaluationTrustFailure>,
+    /// Allowed environment variable names observed for this evaluation.
+    pub allowed_environment_names: Vec<String>,
 }
 
 /// A trust failure that invalidates an otherwise completed evaluation.
@@ -238,11 +242,13 @@ pub fn evaluate(
                     .any(|id| id == &gate.id.to_string())
             })
         {
-            let (run, provided_inventory) = rulebound_exec::checks_green::run_checks_in(
-                rulebound_exec::origin("cargo", &options.cargo_version),
-                timeout(gate),
-                &options.execution_root,
-            );
+            let (run, provided_inventory) =
+                rulebound_exec::checks_green::run_checks_in_with_environment(
+                    rulebound_exec::origin("cargo", &options.cargo_version),
+                    timeout(gate),
+                    &options.execution_root,
+                    &options.environment,
+                );
             runs.push(run);
             inventory = Some(provided_inventory);
         }
@@ -278,6 +284,7 @@ pub fn evaluate(
         observation_fingerprint: observation_fingerprint(observation),
         contract_fingerprint: None,
         trust_failures: Vec::new(),
+        allowed_environment_names: options.environment.allowed_names(),
     }
 }
 
@@ -407,10 +414,11 @@ fn run_gate(
 
     match gate.primitive {
         Primitive::ChecksGreen => {
-            rulebound_exec::checks_green::run_checks_in(
+            rulebound_exec::checks_green::run_checks_in_with_environment(
                 rulebound_exec::origin("cargo", &options.cargo_version),
                 timeout(gate),
                 &options.execution_root,
+                &options.environment,
             )
             .0
         }
@@ -441,7 +449,7 @@ fn run_gate(
                     .find_map(|arg| arg.strip_prefix("--index=").map(str::to_string))
                     .unwrap_or_default(),
             };
-            rulebound_exec::external_tool::run_tool_in(
+            rulebound_exec::external_tool::run_tool_in_with_environment(
                 &gate.id,
                 tool,
                 &gate.args,
@@ -450,6 +458,7 @@ fn run_gate(
                 timeout(gate),
                 rulebound_exec::origin(tool, &options.external_tool_version),
                 &options.execution_root,
+                &options.environment,
             )
         }
         primitive => {

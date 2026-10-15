@@ -22,6 +22,7 @@ use rulebound_orchestrate::{
     Finding, GateRunBuilder, Origin, Side, Subject, SubjectKind, ToolId, UntrustworthyReason,
 };
 
+use crate::EnvironmentPolicy;
 use crate::{Completed, Interpretation, run, template_args};
 
 /// Run a declared tool and absorb its SARIF findings.
@@ -55,7 +56,7 @@ pub fn run_tool(
     origin: Origin,
 ) -> rulebound_orchestrate::GateRun {
     run_tool_at(
-        gate_id, program, args, format, values, timeout, origin, None,
+        gate_id, program, args, format, values, timeout, origin, None, None,
     )
 }
 
@@ -85,6 +86,39 @@ pub fn run_tool_in(
         timeout,
         origin,
         Some(working_directory),
+        None,
+    )
+}
+
+/// Run an external tool in a supplied root with an explicit environment
+/// policy.
+///
+/// # Errors
+///
+/// Execution and output interpretation failures are retained as untrustworthy
+/// gate outcomes.
+#[allow(clippy::too_many_arguments)]
+pub fn run_tool_in_with_environment(
+    gate_id: &GateId,
+    program: &str,
+    args: &[String],
+    format: OutputFormat,
+    values: &TemplateValues,
+    timeout: Duration,
+    origin: Origin,
+    working_directory: &Path,
+    environment: &EnvironmentPolicy,
+) -> rulebound_orchestrate::GateRun {
+    run_tool_at(
+        gate_id,
+        program,
+        args,
+        format,
+        values,
+        timeout,
+        origin,
+        Some(working_directory),
+        Some(environment),
     )
 }
 
@@ -98,6 +132,7 @@ fn run_tool_at(
     timeout: Duration,
     origin: Origin,
     working_directory: Option<&Path>,
+    environment: Option<&EnvironmentPolicy>,
 ) -> rulebound_orchestrate::GateRun {
     let mut builder = GateRunBuilder::new();
 
@@ -109,9 +144,13 @@ fn run_tool_at(
         }
     };
 
-    let completed = match working_directory {
-        Some(path) => crate::run_in(program, &argv, timeout, path),
-        None => run(program, &argv, timeout),
+    let completed = match (working_directory, environment) {
+        (Some(path), Some(policy)) => {
+            crate::run_in_with_environment(program, &argv, timeout, path, policy)
+        }
+        (Some(path), None) => crate::run_in(program, &argv, timeout, path),
+        (None, Some(policy)) => crate::run_with_environment(program, &argv, timeout, policy),
+        (None, None) => run(program, &argv, timeout),
     };
     match completed
         .status
